@@ -1,0 +1,10 @@
+torch>=2.5
+trl>=1.6.0
+transformers>=4.51.0
+accelerate>=1.8.0
+datasets>=3.4.0
+peft>=0.15.0
+sympy>=1.13.0
+pyyaml>=6.0.0
+pytest>=8.0.0
+

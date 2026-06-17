@@ -1,0 +1,55 @@
+The following values were not passed to `accelerate launch` and had defaults used instead:
+        `--num_processes` was set to a value of `4`
+                More than one GPU was found, enabling multi-GPU training.
+                If this was unintended please pass in `--num_processes=1`.
+        `--num_machines` was set to a value of `1`
+        `--mixed_precision` was set to a value of `'no'`
+        `--dynamo_backend` was set to a value of `'no'`
+To avoid this warning pass in values for each of the problematic parameters or run `accelerate config`.
+Built train dataset with 12000 mixed samples.
+Built train dataset with 12000 mixed samples.
+Built train dataset with 12000 mixed samples.
+Built train dataset with 12000 mixed samples.
+/usr/local/lib/python3.12/dist-packages/trl/generation/__init__.py:22: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_client.py:40: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/__init__.py:22: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_client.py:40: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/__init__.py:22: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_client.py:40: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/__init__.py:22: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_client.py:40: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_generation.py:42: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_generation.py:42: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_generation.py:42: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+/usr/local/lib/python3.12/dist-packages/trl/generation/vllm_generation.py:42: UserWarning: TRL currently supports vLLM versions from 0.12.0 to 0.19.0. You have version 0.19.0+cu130 installed. We recommend installing a supported version to avoid compatibility issues.
+  if is_vllm_available():
+Ignoring config keys not accepted by this TRL GRPOConfig: ['max_prompt_length', 'use_cache']
+Ignoring config keys not accepted by this TRL GRPOConfig: ['max_prompt_length', 'use_cache']
+Ignoring config keys not accepted by this TRL GRPOConfig: ['max_prompt_length', 'use_cache']
+Ignoring config keys not accepted by this TRL GRPOConfig: ['max_prompt_length', 'use_cache']
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:16<00:00,  3.24s/it]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:16<00:00,  3.22s/it]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:16<00:00,  3.24s/it]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:17<00:00,  3.45s/it]
+The tokenizer has new PAD/BOS/EOS tokens that differ from the model config and generation config. The model config and generation config were aligned accordingly, being updated with the tokenizer's values. Updated tokens: {'bos_token_id': None, 'pad_token_id': 151643}.
+The tokenizer has new PAD/BOS/EOS tokens that differ from the model config and generation config. The model config and generation config were aligned accordingly, being updated with the tokenizer's values. Updated tokens: {'bos_token_id': None, 'pad_token_id': 151643}.
+The tokenizer has new PAD/BOS/EOS tokens that differ from the model config and generation config. The model config and generation config were aligned accordingly, being updated with the tokenizer's values. Updated tokens: {'bos_token_id': None, 'pad_token_id': 151643}.
+The tokenizer has new PAD/BOS/EOS tokens that differ from the model config and generation config. The model config and generation config were aligned accordingly, being updated with the tokenizer's values. Updated tokens: {'bos_token_id': None, 'pad_token_id': 151643}.
+  0%|                                                                                                                                     | 0/1000 [00:00<?, ?it/s]Could not estimate the number of tokens of the input, floating-point operations will not be computed
+Could not estimate the number of tokens of the input, floating-point operations will not be computed
+Could not estimate the number of tokens of the input, floating-point operations will not be computed
+Could not estimate the number of tokens of the input, floating-point operations will not be computed
+  0%|                                                                                                                         | 1/1000 [01:46<29:29:27, 106.27s/it]Trainer is attempting to log a value of "None" of type <class 'NoneType'> for key "train/rewards/code_reward/mean" as a scalar. This invocation of Tensorboard's writer.add_scalar() is incorrect so we dropped this attribute.
+Trainer is attempting to log a value of "None" of type <class 'NoneType'> for key "train/rewards/code_reward/std" as a scalar. This invocation of Tensorboard's writer.add_scalar() is incorrect so we dropped this attribute.
+{'loss': 0.0823, 'grad_norm': 0.5908165574073792, 'learning_rate': 1e-06, 'num_tokens': 80691.0, 'completions/mean_length': 2419.59375, 'completions/min_length': 536.0, 'completions/max_length': 4096.0, 'completions/clipped_ratio': 0.15625, 'completions/mean_terminated_length': 2109.148193359375, 'completions/min_terminated_length': 536.0, 'completions/max_terminated_length': 3812.0, 'rewards/math_reward/mean': 0.90625, 'rewards/math_reward/std': 0.2961445748806, 'rewards/code_reward/mean': None, 'rewards/code_reward/std': None, 'reward': 0.90625, 'reward_std': 0.2961445748806, 'frac_reward_zero_std': 0.5, 'entropy': 0.22188598103821278, 'clip_ratio/low_mean': 0.0, 'clip_ratio/low_min': 0.0, 'clip_ratio/high_mean': 0.0, 'clip_ratio/high_max': 0.0, 'clip_ratio/region_mean': 0.0, 'step_time': 105.3660584334284, 'epoch': 0.0}

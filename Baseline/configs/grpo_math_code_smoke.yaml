@@ -1,0 +1,41 @@
+model_name_or_path: Qwen/Qwen3-0.6B
+enable_thinking: true
+output_dir: Baseline/outputs/smoke_grpo_math_code
+seed: 7
+use_synthetic_data: true
+
+task_weights:
+  math: 0.5
+  code: 0.5
+max_train_samples: 8
+
+num_generations: 2
+max_prompt_length: 512
+max_completion_length: 128
+learning_rate: 1.0e-6
+max_steps: 1
+num_train_epochs: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+temperature: 1.0
+top_p: 1.0
+beta: 0.0
+loss_type: dapo
+scale_rewards: group
+
+bf16: false
+fp16: false
+gradient_checkpointing: false
+use_cache: false
+logging_steps: 1
+logging_first_step: true
+save_steps: 1
+save_total_limit: 1
+report_to: "none"
+use_vllm: false
+
+allow_code_execution: false
+code_timeout_seconds: 2.0
+eval_strategy: "no"
+eval_batch_size: 1
+eval_max_new_tokens: 128
