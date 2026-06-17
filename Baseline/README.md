@@ -8,10 +8,7 @@ completion is verified by the task-specific verifier.
 
 ```bash
 accelerate launch \
-  --num_processes 4 \
-  --num_machines 1 \
-  --mixed_precision bf16 \
-  --dynamo_backend no \
+  --config_file Baseline/configs/accelerate_deepspeed_zero3_b200.yaml \
   Baseline/train_grpo.py \
   --config Baseline/configs/grpo_math_code_b200.yaml \
   --allow_code_execution
