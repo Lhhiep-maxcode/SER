@@ -7,7 +7,12 @@ completion is verified by the task-specific verifier.
 ## Train
 
 ```bash
-accelerate launch Baseline/train_grpo.py \
+accelerate launch \
+  --num_processes 4 \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  Baseline/train_grpo.py \
   --config Baseline/configs/grpo_math_code_b200.yaml \
   --allow_code_execution
 ```
