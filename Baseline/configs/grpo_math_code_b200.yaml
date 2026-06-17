@@ -1,0 +1,80 @@
+model_name_or_path: Qwen/Qwen3-8B
+enable_thinking: true
+output_dir: Baseline/outputs/grpo_math_code_qwen3_8b
+seed: 42
+
+# Dataset mixture. This is intentionally fixed for the baseline: no SER
+# budget allocation, early stopping, or asynchronous environment scheduling.
+task_weights:
+  math: 0.5
+  code: 0.5
+max_train_samples: 20000
+source_limits:
+  math_train:
+  code_train:
+  math_eval:
+  math500_eval:
+  code_eval:
+  humaneval_eval:
+datasets:
+  gsm8k_name: openai/gsm8k
+  gsm8k_config: main
+  gsm8k_train_split: train
+  gsm8k_eval_split: test
+  math500_name: HuggingFaceH4/MATH-500
+  math500_split: test
+  mbpp_name: google-research-datasets/mbpp
+  mbpp_split: train
+  mbpp_eval_ratio: 0.1
+  humaneval_name: openai/openai_humaneval
+  humaneval_split: test
+
+# GRPO / generation.
+num_generations: 8
+max_prompt_length: 1024
+max_completion_length: 2048
+learning_rate: 1.0e-6
+max_steps: 1000
+num_train_epochs: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+generation_batch_size:
+steps_per_generation:
+temperature: 1.0
+top_p: 1.0
+beta: 0.0
+loss_type: dapo
+scale_rewards: group
+mask_truncated_completions: false
+
+# Server-oriented precision/runtime defaults.
+bf16: true
+tf32: true
+gradient_checkpointing: true
+use_cache: false
+dataloader_num_workers: 4
+save_steps: 100
+save_total_limit: 3
+report_to: "tensorboard"
+logging_dir: Baseline/outputs/tensorboard/grpo_math_code_qwen3_8b
+run_name: grpo_math_code_qwen3_8b
+logging_steps: 10
+logging_first_step: true
+
+# Optional vLLM acceleration. Set use_vllm: true after starting:
+# trl vllm-serve --model Qwen/Qwen3-8B
+use_vllm: false
+vllm_mode: server
+vllm_server_host: 0.0.0.0
+vllm_server_port: 8000
+vllm_server_timeout: 240.0
+
+# Code verifier safety. Training must still pass --allow_code_execution unless
+# this is explicitly flipped to true in a trusted environment.
+allow_code_execution: false
+code_timeout_seconds: 5.0
+
+# Evaluation defaults used by Baseline/evaluate.py.
+eval_strategy: "no"
+eval_batch_size: 1
+eval_max_new_tokens: 2048
