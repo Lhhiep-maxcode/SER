@@ -79,6 +79,7 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_datasets,
     )
+    add_log_sanitizer_callback(trainer)
     add_stats_callback(trainer, stats)
 
     trainer.train(resume_from_checkpoint=config.get("resume_from_checkpoint"))
@@ -175,6 +176,25 @@ def add_stats_callback(trainer, stats: RewardStats) -> None:
                 self.writer.close()
 
     trainer.add_callback(VerifierStatsCallback())
+
+
+def add_log_sanitizer_callback(trainer) -> None:
+    try:
+        from transformers import TrainerCallback
+    except Exception:
+        return
+
+    class DropNoneLogsCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is None:
+                return
+            for key in list(logs):
+                if logs[key] is None:
+                    del logs[key]
+
+    # Put this before TensorBoardCallback so non-scalar None values are removed
+    # before Hugging Face tries to write them as scalars.
+    trainer.callback_handler.callbacks.insert(0, DropNoneLogsCallback())
 
 
 def _uses_code_task(config: dict[str, Any]) -> bool:
