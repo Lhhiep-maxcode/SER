@@ -111,6 +111,7 @@ def evaluate_dataset(
                     completion,
                     row["tests"],
                     entry_point=row.get("entry_point") or None,
+                    test_type=row.get("test_type") or "assert",
                     timeout_seconds=float(config.get("code_timeout_seconds", 5.0)),
                 )
                 passed = code_result.passed
@@ -196,4 +197,3 @@ def load_config(path: str) -> dict[str, Any]:
 
 if __name__ == "__main__":
     main()
-

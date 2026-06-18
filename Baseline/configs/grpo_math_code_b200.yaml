@@ -1,33 +1,24 @@
 model_name_or_path: Qwen/Qwen3-8B
 enable_thinking: true
-output_dir: Baseline/outputs/grpo_math_code_qwen3_8b
+output_dir: Baseline/outputs/grpo_dapo_taco_qwen3_8b
 seed: 42
 
-# Dataset mixture. This is intentionally fixed for the baseline: no SER
-# budget allocation, early stopping, or asynchronous environment scheduling.
+# Training data is now preprocessed once with Baseline/preprocess_datasets.py.
+# It contains DAPO-Math-17k math rows + TACO code rows only.
+processed_train_path: Baseline/processed/dapo_taco/train
+processed_eval_dir: Baseline/processed/dapo_taco/eval
+eval_dataset_names:
+  - gsm8k
+  - math500
+  - mbpp
+  - humaneval
+
+# Kept for experiment bookkeeping and code-execution safety checks. Actual
+# weighted sampling happens in Baseline/preprocess_datasets.py.
 task_weights:
   math: 0.5
   code: 0.5
-max_train_samples: 20000
-source_limits:
-  math_train:
-  code_train:
-  math_eval:
-  math500_eval:
-  code_eval:
-  humaneval_eval:
-datasets:
-  gsm8k_name: openai/gsm8k
-  gsm8k_config: main
-  gsm8k_train_split: train
-  gsm8k_eval_split: test
-  math500_name: HuggingFaceH4/MATH-500
-  math500_split: test
-  mbpp_name: google-research-datasets/mbpp
-  mbpp_split: train
-  mbpp_eval_ratio: 0.1
-  humaneval_name: openai/openai_humaneval
-  humaneval_split: test
+max_train_samples:
 
 # GRPO / generation.
 num_generations: 8
@@ -56,8 +47,8 @@ dataloader_num_workers: 4
 save_steps: 100
 save_total_limit: 3
 report_to: "tensorboard"
-logging_dir: Baseline/outputs/tensorboard/grpo_math_code_qwen3_8b
-run_name: grpo_math_code_qwen3_8b
+logging_dir: Baseline/outputs/tensorboard/grpo_dapo_taco_qwen3_8b
+run_name: grpo_dapo_taco_qwen3_8b
 logging_steps: 10
 logging_first_step: true
 

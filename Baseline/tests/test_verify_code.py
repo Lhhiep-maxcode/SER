@@ -1,4 +1,5 @@
 import unittest
+import json
 
 from Baseline.verify_code import (
     extract_python_code,
@@ -44,7 +45,25 @@ class CodeVerifierTests(unittest.TestCase):
     def test_infers_entry_point(self):
         self.assertEqual(infer_entry_point_from_tests(["assert square(3) == 9"]), "square")
 
+    def test_passes_stdin_stdout_solution(self):
+        result = verify_code_completion(
+            "a, b = map(int, input().split())\nprint(a + b)",
+            [json.dumps({"input": "2 5\n", "output": "7\n"})],
+            test_type="stdin_stdout",
+            timeout_seconds=2.0,
+        )
+        self.assertTrue(result.passed)
+
+    def test_fails_stdin_stdout_wrong_answer(self):
+        result = verify_code_completion(
+            "a, b = map(int, input().split())\nprint(a - b)",
+            [json.dumps({"input": "2 5\n", "output": "7\n"})],
+            test_type="stdin_stdout",
+            timeout_seconds=2.0,
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_type, "wrong_answer")
+
 
 if __name__ == "__main__":
     unittest.main()
-

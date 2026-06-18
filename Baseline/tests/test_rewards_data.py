@@ -1,9 +1,11 @@
 import unittest
+import json
+import random
 
 from Baseline.data import (
-    build_mixed_dataset_from_records,
-    weighted_mix_records,
+    build_train_dataset,
 )
+from Baseline.preprocess_datasets import sample_train_records
 from Baseline.rewards import make_code_reward, make_math_reward
 
 
@@ -16,6 +18,8 @@ MATH_RECORDS = [
         "answer": "4",
         "tests": [],
         "entry_point": "",
+        "test_type": "",
+        "difficulty": "",
     }
 ]
 
@@ -28,38 +32,40 @@ CODE_RECORDS = [
         "answer": "",
         "tests": ["assert add_one(1) == 2"],
         "entry_point": "add_one",
+        "test_type": "assert",
+        "difficulty": "EASY",
     }
 ]
 
 
 class RewardsAndDataTests(unittest.TestCase):
     def test_weighted_mix_is_deterministic(self):
-        first = weighted_mix_records(
-            {"math": MATH_RECORDS, "code": CODE_RECORDS},
-            {"math": 0.5, "code": 0.5},
-            max_samples=6,
-            seed=123,
+        first = sample_train_records(
+            MATH_RECORDS,
+            CODE_RECORDS,
+            train_size=6,
+            math_weight=0.5,
+            code_weight=0.5,
+            code_difficulty_weights={"EASY": 1.0},
+            rng=random.Random(123),
         )
-        second = weighted_mix_records(
-            {"math": MATH_RECORDS, "code": CODE_RECORDS},
-            {"math": 0.5, "code": 0.5},
-            max_samples=6,
-            seed=123,
+        second = sample_train_records(
+            MATH_RECORDS,
+            CODE_RECORDS,
+            train_size=6,
+            math_weight=0.5,
+            code_weight=0.5,
+            code_difficulty_weights={"EASY": 1.0},
+            rng=random.Random(123),
         )
         self.assertEqual(first, second)
         self.assertEqual(len(first), 6)
         self.assertTrue({record["task"] for record in first}.issubset({"math", "code"}))
 
-    def test_dataset_schema(self):
-        dataset = build_mixed_dataset_from_records(
-            MATH_RECORDS,
-            CODE_RECORDS,
-            task_weights={"math": 0.5, "code": 0.5},
-            max_samples=4,
-            seed=5,
-        )
+    def test_synthetic_train_dataset_schema(self):
+        dataset = build_train_dataset({"use_synthetic_data": True})
         self.assertEqual(len(dataset), 4)
-        for column in ("prompt", "task", "answer", "tests", "entry_point"):
+        for column in ("prompt", "task", "answer", "tests", "entry_point", "test_type"):
             self.assertIn(column, dataset.column_names)
 
     def test_math_reward_routes_by_task(self):
@@ -86,6 +92,20 @@ class RewardsAndDataTests(unittest.TestCase):
                 task=["code"],
                 tests=[["assert add_one(1) == 2"]],
                 entry_point=["add_one"],
+                test_type=["assert"],
+            ),
+            [1.0],
+        )
+
+    def test_code_reward_executes_stdin_stdout_when_allowed(self):
+        reward = make_code_reward(allow_code_execution=True, timeout_seconds=2.0)
+        self.assertEqual(
+            reward(
+                ["a, b = map(int, input().split())\nprint(a + b)"],
+                task=["code"],
+                tests=[[json.dumps({"input": "3 4\n", "output": "7\n"})]],
+                entry_point=[""],
+                test_type=["stdin_stdout"],
             ),
             [1.0],
         )
@@ -93,4 +113,3 @@ class RewardsAndDataTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

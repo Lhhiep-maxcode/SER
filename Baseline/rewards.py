@@ -87,15 +87,23 @@ def make_code_reward(
 ) -> RewardFunction:
     reward_stats = stats or RewardStats()
 
-    def code_reward(completions, task=None, tests=None, entry_point=None, **kwargs) -> list[Optional[float]]:
+    def code_reward(
+        completions,
+        task=None,
+        tests=None,
+        entry_point=None,
+        test_type=None,
+        **kwargs,
+    ) -> list[Optional[float]]:
         texts = [completion_to_text(item) for item in completions]
         tasks = _as_list(task, len(texts), default="code")
         test_cases = _as_list(tests or kwargs.get("test_list"), len(texts), default=[])
         entry_points = _as_list(entry_point, len(texts), default="")
+        test_types = _as_list(test_type, len(texts), default="assert")
 
         rewards: list[Optional[float]] = []
-        for text, sample_task, sample_tests, sample_entry_point in zip(
-            texts, tasks, test_cases, entry_points
+        for text, sample_task, sample_tests, sample_entry_point, sample_test_type in zip(
+            texts, tasks, test_cases, entry_points, test_types
         ):
             if sample_task != "code":
                 rewards.append(None)
@@ -109,6 +117,7 @@ def make_code_reward(
                 text,
                 sample_tests,
                 entry_point=sample_entry_point or None,
+                test_type=sample_test_type or "assert",
                 timeout_seconds=timeout_seconds,
             )
             reward_stats.code_calls += 1
@@ -150,4 +159,3 @@ def _as_list(value: Any, length: int, *, default: Any) -> list[Any]:
         if len(value) == 1:
             return value * length
     return [value for _ in range(length)]
-
