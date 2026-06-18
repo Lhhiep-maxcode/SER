@@ -13,12 +13,13 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 
 try:
     from .formatting import code_prompt, math_prompt
@@ -195,14 +196,7 @@ def load_taco_records(
     max_tests_per_sample: Optional[int],
     trust_remote_code: bool,
 ) -> list[dict[str, Any]]:
-    kwargs: dict[str, Any] = {"split": split}
-    if trust_remote_code:
-        kwargs["trust_remote_code"] = True
-    try:
-        dataset = load_dataset(name, **kwargs)
-    except TypeError:
-        kwargs.pop("trust_remote_code", None)
-        dataset = load_dataset(name, **kwargs)
+    dataset = load_taco_dataset(name, split=split, trust_remote_code=trust_remote_code)
 
     records: list[dict[str, Any]] = []
     for idx, row in enumerate(_limit(dataset, max_records)):
@@ -253,6 +247,105 @@ def load_taco_records(
             )
         )
     return records
+
+
+def load_taco_dataset(name: str, *, split: str, trust_remote_code: bool):
+    local_path = Path(name)
+    if local_path.exists():
+        return load_taco_arrow_split(local_path, split)
+
+    kwargs: dict[str, Any] = {"split": split}
+    if trust_remote_code:
+        kwargs["trust_remote_code"] = True
+
+    try:
+        return load_dataset(name, **kwargs)
+    except TypeError:
+        kwargs.pop("trust_remote_code", None)
+        try:
+            return load_dataset(name, **kwargs)
+        except RuntimeError as exc:
+            return _load_taco_after_script_error(name, split, exc)
+    except RuntimeError as exc:
+        return _load_taco_after_script_error(name, split, exc)
+
+
+def _load_taco_after_script_error(name: str, split: str, exc: RuntimeError):
+        if "Dataset scripts are no longer supported" not in str(exc):
+            raise
+        snapshot_path = find_hf_snapshot(name)
+        if snapshot_path is None:
+            raise RuntimeError(
+                "TACO uses a legacy dataset script that this datasets version refuses. "
+                "Download the raw TACO dataset repo locally and pass "
+                "`--taco_name /path/to/BAAI_TACO`, or downgrade datasets to a version "
+                "that still supports dataset scripts."
+            ) from exc
+        print(f"Falling back to direct TACO Arrow loading from {snapshot_path}")
+        return load_taco_arrow_split(snapshot_path, split)
+
+
+def load_taco_arrow_split(root: Path, split: str):
+    split_dir = root / split
+    if not split_dir.exists():
+        raise FileNotFoundError(
+            f"Could not find TACO split directory {split_dir}. Expected raw repo layout "
+            "with files like train/data-00000-of-00009.arrow."
+        )
+
+    arrow_files = sorted(split_dir.glob("*.arrow"))
+    if arrow_files:
+        shards = [Dataset.from_file(str(path)) for path in arrow_files]
+        return concatenate_datasets(shards) if len(shards) > 1 else shards[0]
+
+    parquet_files = sorted(split_dir.glob("*.parquet"))
+    if parquet_files:
+        return load_dataset(
+            "parquet",
+            data_files={split: [str(path) for path in parquet_files]},
+            split=split,
+        )
+
+    json_files = sorted(split_dir.glob("*.json")) + sorted(split_dir.glob("*.jsonl"))
+    if json_files:
+        return load_dataset(
+            "json",
+            data_files={split: [str(path) for path in json_files]},
+            split=split,
+        )
+
+    raise FileNotFoundError(f"No Arrow, Parquet, JSON, or JSONL files found in {split_dir}.")
+
+
+def find_hf_snapshot(repo_id: str) -> Optional[Path]:
+    try:
+        from huggingface_hub import snapshot_download
+
+        path = snapshot_download(repo_id=repo_id, repo_type="dataset", local_files_only=True)
+        if path:
+            return Path(path)
+    except Exception:
+        pass
+
+    candidates = []
+    repo_cache_name = "datasets--" + repo_id.replace("/", "--")
+    env_roots = [
+        os.environ.get("HF_HOME"),
+        os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        str(Path.home() / ".cache" / "huggingface"),
+    ]
+    for root in env_roots:
+        if not root:
+            continue
+        base = Path(root)
+        candidates.extend((base / "hub" / repo_cache_name / "snapshots").glob("*"))
+        candidates.extend((base / repo_cache_name / "snapshots").glob("*"))
+
+    valid = [path for path in candidates if (path / "train").exists() or (path / "test").exists()]
+    if not valid:
+        return None
+    valid.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return valid[0]
 
 
 def build_eval_sets(args: argparse.Namespace) -> dict[str, list[dict[str, Any]]]:
