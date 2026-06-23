@@ -1,0 +1,8 @@
+transformers==4.49.0
+torch==2.8.0
+peft==0.17.1
+datasets==4.0.0
+numpy
+tqdm
+safetensors
+sympy>=1.13.0

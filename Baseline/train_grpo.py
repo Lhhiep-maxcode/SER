@@ -29,6 +29,7 @@ BASELINE_ONLY_CONFIG_KEYS = {
     "processed_eval_dir",
     "eval_dataset_paths",
     "eval_dataset_names",
+    "resume_from_checkpoint",
     "source_limits",
     "task_weights",
     "use_synthetic_data",
@@ -86,7 +87,7 @@ def main() -> None:
     add_log_sanitizer_callback(trainer)
     add_stats_callback(trainer, stats)
 
-    trainer.train(resume_from_checkpoint=config.get("resume_from_checkpoint"))
+    trainer.train(resume_from_checkpoint=normalize_resume_from_checkpoint(config.get("resume_from_checkpoint")))
     trainer.save_model(config.get("output_dir"))
     print("Final verifier stats:", stats.log_dict())
 
@@ -102,6 +103,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_name_or_path", help="Override the configured model path.")
     parser.add_argument("--output_dir", help="Override the configured output directory.")
     parser.add_argument("--max_steps", type=int, help="Override max_steps.")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        nargs="?",
+        const="latest",
+        help=(
+            "Resume training. Use without a value or with 'latest' to resume from "
+            "the newest checkpoint in output_dir, or pass a checkpoint path."
+        ),
+    )
     parser.add_argument(
         "--dry_run",
         action="store_true",
@@ -122,7 +132,7 @@ def load_config(path: str) -> dict[str, Any]:
 
 
 def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
-    for key in ("model_name_or_path", "output_dir", "max_steps"):
+    for key in ("model_name_or_path", "output_dir", "max_steps", "resume_from_checkpoint"):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
@@ -208,6 +218,19 @@ def _uses_code_task(config: dict[str, Any]) -> bool:
 def eval_is_enabled(config: dict[str, Any]) -> bool:
     value = config.get("eval_strategy", "no")
     return str(value).lower() not in {"no", "false", "none", "0"}
+
+
+def normalize_resume_from_checkpoint(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if text.lower() in {"", "false", "no", "none", "0"}:
+        return None
+    if text.lower() in {"true", "yes", "latest", "1"}:
+        return True
+    return text
 
 
 if __name__ == "__main__":
