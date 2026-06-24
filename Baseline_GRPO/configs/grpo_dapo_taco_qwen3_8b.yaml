@@ -1,0 +1,46 @@
+model_dir: Qwen/Qwen3-8B
+dataset_path: Baseline/processed/dapo_taco/train
+output_dir: Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b
+log_file: Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/train.jsonl
+resume_from_checkpoint: ""
+
+batch_size: 1
+num_epochs: 1
+max_steps:
+max_train_samples:
+accumulation_steps: 8
+target_lr: 1.0e-6
+max_grad_norm: 1.0
+
+repeated_generate_nums: 8
+grpo_iteration_num: 1
+temperature: 1.0
+top_p: 0.95
+max_length: 2048
+max_prompt_length: 1024
+max_training_token: 3072
+max_training_padding_gap: 256
+epsilon: 0.1
+beta: 0.01
+
+lora_r: 64
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+enable_thinking: true
+allow_code_execution: true
+code_timeout_seconds: 5.0
+save_steps: 500
+num_workers: 4
+seed: 42
+
+use_tensorboard: true
+tensorboard_log_dir: Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/tensorboard

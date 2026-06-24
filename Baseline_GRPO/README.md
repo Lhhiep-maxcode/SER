@@ -15,41 +15,45 @@ The implementation mirrors the FastGRPO training style:
 
 ## Run
 
+Preferred config-driven launch:
+
 ```bash
 python Baseline_GRPO/grpo_baseline.py \
-  --model_dir Qwen/Qwen3-8B \
-  --dataset_path Baseline/processed/dapo_taco/train \
-  --output_dir Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b \
-  --log_file Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/train.jsonl \
-  --batch_size 1 \
-  --num_epochs 1 \
-  --accumulation_steps 8 \
-  --target_lr 1e-6 \
-  --repeated_generate_nums 8 \
-  --temperature 1.0 \
-  --top_p 0.95 \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --max_training_token 3072 \
-  --max_training_padding_gap 256 \
-  --beta 0.01 \
-  --epsilon 0.1 \
-  --enable_thinking \
-  --allow_code_execution
+  --config Baseline_GRPO/configs/grpo_dapo_taco_qwen3_8b.yaml
+```
+
+Command-line arguments override YAML values, for example:
+
+```bash
+python Baseline_GRPO/grpo_baseline.py \
+  --config Baseline_GRPO/configs/grpo_dapo_taco_qwen3_8b.yaml \
+  --max_steps 1000 \
+  --tensorboard_log_dir Baseline_GRPO/outputs/debug_tensorboard
 ```
 
 Use `CUDA_VISIBLE_DEVICES=0` if you want the same single-GPU launch style as
 the current FastGRPO script.
 
+The provided config enables code execution because code rewards run generated
+Python tests. Use it only in a trusted training environment.
+
+## TensorBoard
+
+```bash
+tensorboard \
+  --logdir Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/tensorboard \
+  --port 6006
+```
+
+The JSONL training log is still written to `log_file`. TensorBoard receives the
+same numeric training metrics under `train/*`, including reward, loss, KL,
+timing, sequence counts, verifier calls, and domain accuracies.
+
 ## Resume
 
 ```bash
 python Baseline_GRPO/grpo_baseline.py \
-  --model_dir Qwen/Qwen3-8B \
-  --dataset_path Baseline/processed/dapo_taco/train \
+  --config Baseline_GRPO/configs/grpo_dapo_taco_qwen3_8b.yaml \
   --resume_from_checkpoint Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/step500 \
-  --output_dir Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b \
-  --log_file Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/train.jsonl \
-  --allow_code_execution
+  --max_steps 2000
 ```
-

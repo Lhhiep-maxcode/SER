@@ -28,6 +28,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional unless --config is used.
+    yaml = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover - tensorboard may be absent on minimal installs.
+    SummaryWriter = None
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -39,12 +49,51 @@ from Baseline_GRPO.data_utils import (  # noqa: E402
 from Baseline_GRPO.reward_utils import RewardStats, compute_reward  # noqa: E402
 
 
+DEFAULT_CONFIG: dict[str, Any] = {
+    "model_dir": "",
+    "dataset_path": "Baseline/processed/dapo_taco/train",
+    "output_dir": "Baseline_GRPO/outputs/grpo_dapo_taco",
+    "log_file": "Baseline_GRPO/outputs/grpo_dapo_taco/train.jsonl",
+    "resume_from_checkpoint": "",
+    "batch_size": 1,
+    "num_epochs": 1,
+    "max_steps": None,
+    "max_train_samples": None,
+    "accumulation_steps": 8,
+    "target_lr": 1e-6,
+    "max_grad_norm": 1.0,
+    "repeated_generate_nums": 8,
+    "grpo_iteration_num": 1,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_length": 2048,
+    "max_prompt_length": 1024,
+    "max_training_token": 3072,
+    "max_training_padding_gap": 256,
+    "epsilon": 0.1,
+    "beta": 0.01,
+    "lora_r": 64,
+    "lora_alpha": 32,
+    "lora_dropout": 0.0,
+    "lora_target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    "enable_thinking": False,
+    "allow_code_execution": False,
+    "code_timeout_seconds": 5.0,
+    "save_steps": 500,
+    "num_workers": 4,
+    "seed": 42,
+    "use_tensorboard": True,
+    "tensorboard_log_dir": "Baseline_GRPO/outputs/grpo_dapo_taco/tensorboard",
+}
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     setup_output_dirs(args)
 
     print_config(args)
+    writer = build_tensorboard_writer(args)
     dataset = load_processed_dataset(args.dataset_path, max_samples=args.max_train_samples)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, padding_side="left", trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -77,67 +126,72 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
     install_signal_handler()
 
-    with Path(args.log_file).open("a", encoding="utf-8") as log_handle:
-        for epoch in range(args.num_epochs):
-            epoch_iter = tqdm(dataloader, desc=f"epoch {epoch + 1}/{args.num_epochs}")
-            for batch_index, batch in enumerate(epoch_iter):
-                if batch["input_ids"].shape[-1] >= args.max_length:
-                    continue
-                batch_start = time.time()
-                train_batch = generate_and_score_batch(model, tokenizer, batch, args, stats)
-                if not train_batch["messages"]:
-                    continue
+    try:
+        with Path(args.log_file).open("a", encoding="utf-8") as log_handle:
+            for epoch in range(args.num_epochs):
+                epoch_iter = tqdm(dataloader, desc=f"epoch {epoch + 1}/{args.num_epochs}")
+                for batch_index, batch in enumerate(epoch_iter):
+                    if batch["input_ids"].shape[-1] >= args.max_length:
+                        continue
+                    batch_start = time.time()
+                    train_batch = generate_and_score_batch(model, tokenizer, batch, args, stats)
+                    if not train_batch["messages"]:
+                        continue
 
-                train_start = time.time()
-                loss_logs = train_on_batch(model, tokenizer, train_batch, optimizer, args, state)
-                train_seconds = time.time() - train_start
-                state.used_items += train_batch["used_items"]
-                state.generated_groups += len(batch["rows"])
-                state.skipped_zero_std += train_batch["skipped_zero_std"]
-                state.skipped_correct += train_batch["skipped_correct"]
-                state.skipped_incorrect += train_batch["skipped_incorrect"]
+                    train_start = time.time()
+                    loss_logs = train_on_batch(model, tokenizer, train_batch, optimizer, args, state)
+                    train_seconds = time.time() - train_start
+                    state.used_items += train_batch["used_items"]
+                    state.generated_groups += len(batch["rows"])
+                    state.skipped_zero_std += train_batch["skipped_zero_std"]
+                    state.skipped_correct += train_batch["skipped_correct"]
+                    state.skipped_incorrect += train_batch["skipped_incorrect"]
 
-                if state.accumulated_batches % args.accumulation_steps == 0:
-                    if args.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    state.optimizer_steps += 1
+                    if state.accumulated_batches % args.accumulation_steps == 0:
+                        if args.max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        state.optimizer_steps += 1
 
-                log_data = build_log_record(
-                    args,
-                    state,
-                    stats,
-                    epoch=epoch,
-                    batch_index=batch_index,
-                    train_batch=train_batch,
-                    loss_logs=loss_logs,
-                    batch_seconds=time.time() - batch_start,
-                    train_seconds=train_seconds,
-                )
-                log_handle.write(json.dumps(log_data) + "\n")
-                log_handle.flush()
-                epoch_iter.set_postfix(
-                    step=state.optimizer_steps,
-                    reward=round(log_data["mean_reward"], 4),
-                    used=state.used_items,
-                )
+                    log_data = build_log_record(
+                        args,
+                        state,
+                        stats,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                        train_batch=train_batch,
+                        loss_logs=loss_logs,
+                        batch_seconds=time.time() - batch_start,
+                        train_seconds=train_seconds,
+                    )
+                    log_handle.write(json.dumps(log_data) + "\n")
+                    log_handle.flush()
+                    write_tensorboard_scalars(writer, log_data, state.accumulated_batches)
+                    epoch_iter.set_postfix(
+                        step=state.optimizer_steps,
+                        reward=round(log_data["mean_reward"], 4),
+                        used=state.used_items,
+                    )
 
-                if args.save_steps > 0 and state.optimizer_steps > 0 and state.optimizer_steps % args.save_steps == 0:
-                    save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                    if args.save_steps > 0 and state.optimizer_steps > 0 and state.optimizer_steps % args.save_steps == 0:
+                        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
 
-                if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
-                    save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
-                    return
+                    if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
+                        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                        return
 
-    if state.accumulated_batches % args.accumulation_steps != 0:
-        if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        state.optimizer_steps += 1
+        if state.accumulated_batches % args.accumulation_steps != 0:
+            if args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            state.optimizer_steps += 1
 
-    save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 class TrainingState:
@@ -153,47 +207,65 @@ class TrainingState:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model_dir", required=True)
-    parser.add_argument("--dataset_path", default="Baseline/processed/dapo_taco/train")
-    parser.add_argument("--output_dir", default="Baseline_GRPO/outputs/grpo_dapo_taco")
-    parser.add_argument("--log_file", default="Baseline_GRPO/outputs/grpo_dapo_taco/train.jsonl")
-    parser.add_argument("--resume_from_checkpoint", default="")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default="")
+    config_args, _ = config_parser.parse_known_args()
 
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int)
-    parser.add_argument("--max_train_samples", type=int)
-    parser.add_argument("--accumulation_steps", type=int, default=8)
-    parser.add_argument("--target_lr", type=float, default=1e-6)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    defaults = dict(DEFAULT_CONFIG)
+    if config_args.config:
+        defaults.update(load_yaml_config(config_args.config))
+    defaults["config"] = config_args.config
 
-    parser.add_argument("--repeated_generate_nums", type=int, default=8)    # Group size for reward normalization
-    parser.add_argument("--grpo_iteration_num", type=int, default=1)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--max_length", type=int, default=2048)
-    parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_training_token", type=int, default=3072)     # Maximum number of tokens in a training chunk (after padding)
-    parser.add_argument("--max_training_padding_gap", type=int, default=256)# Maximum allowed padding in a training chunk (after padding)
-    parser.add_argument("--epsilon", type=float, default=0.1)
-    parser.add_argument("--beta", type=float, default=0.01)
+    parser = argparse.ArgumentParser(description=__doc__, parents=[config_parser])
+    parser.add_argument("--model_dir", default=defaults["model_dir"])
+    parser.add_argument("--dataset_path", default=defaults["dataset_path"])
+    parser.add_argument("--output_dir", default=defaults["output_dir"])
+    parser.add_argument("--log_file", default=defaults["log_file"])
+    parser.add_argument("--resume_from_checkpoint", default=defaults["resume_from_checkpoint"])
 
-    parser.add_argument("--lora_r", type=int, default=64)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--batch_size", type=int, default=defaults["batch_size"])
+    parser.add_argument("--num_epochs", type=int, default=defaults["num_epochs"])
+    parser.add_argument("--max_steps", type=optional_int, default=defaults["max_steps"])
+    parser.add_argument("--max_train_samples", type=optional_int, default=defaults["max_train_samples"])
+    parser.add_argument("--accumulation_steps", type=int, default=defaults["accumulation_steps"])
+    parser.add_argument("--target_lr", type=float, default=defaults["target_lr"])
+    parser.add_argument("--max_grad_norm", type=float, default=defaults["max_grad_norm"])
+
+    parser.add_argument("--repeated_generate_nums", type=int, default=defaults["repeated_generate_nums"])
+    parser.add_argument("--grpo_iteration_num", type=int, default=defaults["grpo_iteration_num"])
+    parser.add_argument("--temperature", type=float, default=defaults["temperature"])
+    parser.add_argument("--top_p", type=float, default=defaults["top_p"])
+    parser.add_argument("--max_length", type=int, default=defaults["max_length"])
+    parser.add_argument("--max_prompt_length", type=int, default=defaults["max_prompt_length"])
+    parser.add_argument("--max_training_token", type=int, default=defaults["max_training_token"])
+    parser.add_argument("--max_training_padding_gap", type=int, default=defaults["max_training_padding_gap"])
+    parser.add_argument("--epsilon", type=float, default=defaults["epsilon"])
+    parser.add_argument("--beta", type=float, default=defaults["beta"])
+
+    parser.add_argument("--lora_r", type=int, default=defaults["lora_r"])
+    parser.add_argument("--lora_alpha", type=int, default=defaults["lora_alpha"])
+    parser.add_argument("--lora_dropout", type=float, default=defaults["lora_dropout"])
     parser.add_argument(
         "--lora_target_modules",
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        default=defaults["lora_target_modules"],
     )
 
-    parser.add_argument("--enable_thinking", action="store_true")
-    parser.add_argument("--allow_code_execution", action="store_true")
-    parser.add_argument("--code_timeout_seconds", type=float, default=5.0)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
+    parser.add_argument("--enable_thinking", type=str_to_bool, nargs="?", const=True, default=defaults["enable_thinking"])
+    parser.add_argument("--allow_code_execution", type=str_to_bool, nargs="?", const=True, default=defaults["allow_code_execution"])
+    parser.add_argument("--code_timeout_seconds", type=float, default=defaults["code_timeout_seconds"])
+    parser.add_argument("--save_steps", type=int, default=defaults["save_steps"])
+    parser.add_argument("--num_workers", type=int, default=defaults["num_workers"])
+    parser.add_argument("--seed", type=int, default=defaults["seed"])
+    parser.add_argument("--use_tensorboard", type=str_to_bool, nargs="?", const=True, default=defaults["use_tensorboard"])
+    parser.add_argument("--tensorboard_log_dir", default=defaults["tensorboard_log_dir"])
+
+    args = parser.parse_args()
+    args.enable_thinking = str_to_bool(args.enable_thinking)
+    args.allow_code_execution = str_to_bool(args.allow_code_execution)
+    args.use_tensorboard = str_to_bool(args.use_tensorboard)
+    if not args.model_dir:
+        parser.error("model_dir is required. Set it in --config YAML or pass --model_dir.")
+    return args
 
 
 def build_model(args: argparse.Namespace):
@@ -213,7 +285,7 @@ def build_model(args: argparse.Namespace):
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=[item.strip() for item in args.lora_target_modules.split(",") if item.strip()],
+            target_modules=parse_list_arg(args.lora_target_modules),
         )
         model = get_peft_model(base_model, lora_config)
     return model.cuda()
@@ -544,6 +616,47 @@ def maybe_load_optimizer(args, optimizer) -> int:
     return 0
 
 
+def load_yaml_config(path: str) -> dict[str, Any]:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required for --config. Install it with `pip install pyyaml`.")
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file does not exist: {config_path}")
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a YAML mapping: {config_path}")
+    unknown_keys = sorted(set(data) - set(DEFAULT_CONFIG))
+    if unknown_keys:
+        raise ValueError(f"Unknown config keys in {config_path}: {', '.join(unknown_keys)}")
+    return data
+
+
+def str_to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
+def optional_int(value) -> int | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    return int(value)
+
+
+def parse_list_arg(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
 def model_device(model):
     return next(model.parameters()).device
 
@@ -551,8 +664,36 @@ def model_device(model):
 def setup_output_dirs(args) -> None:
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     Path(args.log_file).parent.mkdir(parents=True, exist_ok=True)
+    if args.use_tensorboard:
+        Path(args.tensorboard_log_dir).mkdir(parents=True, exist_ok=True)
     if not args.resume_from_checkpoint:
         Path(args.log_file).write_text("", encoding="utf-8")
+
+
+def build_tensorboard_writer(args):
+    if not args.use_tensorboard:
+        return None
+    if SummaryWriter is None:
+        raise RuntimeError("TensorBoard logging is enabled, but tensorboard is not installed.")
+    writer = SummaryWriter(log_dir=args.tensorboard_log_dir)
+    writer.add_text("config/resolved", json.dumps(serializable_config(args), indent=2), 0)
+    return writer
+
+
+def write_tensorboard_scalars(writer, log_data: dict[str, Any], step: int) -> None:
+    if writer is None:
+        return
+    for key, value in log_data.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        numeric = float(value)
+        if math.isfinite(numeric):
+            writer.add_scalar(f"train/{key}", numeric, step)
+    writer.flush()
+
+
+def serializable_config(args) -> dict[str, Any]:
+    return {key: value for key, value in sorted(vars(args).items())}
 
 
 def print_config(args) -> None:

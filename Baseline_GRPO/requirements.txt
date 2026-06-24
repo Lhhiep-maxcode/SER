@@ -6,3 +6,5 @@ numpy
 tqdm
 safetensors
 sympy>=1.13.0
+pyyaml
+tensorboard
