@@ -72,6 +72,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_training_padding_gap": 256,
     "epsilon": 0.1,
     "beta": 0.01,
+    "gradient_checkpointing": True,
+    "use_cache": False,
     "lora_r": 64,
     "lora_alpha": 32,
     "lora_dropout": 0.0,
@@ -242,6 +244,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=defaults["epsilon"])
     parser.add_argument("--beta", type=float, default=defaults["beta"])
 
+    parser.add_argument(
+        "--gradient_checkpointing",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=defaults["gradient_checkpointing"],
+    )
+    parser.add_argument(
+        "--use_cache",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=defaults["use_cache"],
+    )
     parser.add_argument("--lora_r", type=int, default=defaults["lora_r"])
     parser.add_argument("--lora_alpha", type=int, default=defaults["lora_alpha"])
     parser.add_argument("--lora_dropout", type=float, default=defaults["lora_dropout"])
@@ -263,6 +279,8 @@ def parse_args() -> argparse.Namespace:
     args.enable_thinking = str_to_bool(args.enable_thinking)
     args.allow_code_execution = str_to_bool(args.allow_code_execution)
     args.use_tensorboard = str_to_bool(args.use_tensorboard)
+    args.gradient_checkpointing = str_to_bool(args.gradient_checkpointing)
+    args.use_cache = str_to_bool(args.use_cache)
     if not args.model_dir:
         parser.error("model_dir is required. Set it in --config YAML or pass --model_dir.")
     return args
@@ -274,8 +292,12 @@ def build_model(args: argparse.Namespace):
         torch_dtype="auto",
         trust_remote_code=True,
     ).cuda()
-    base_model.config.use_cache = False
-    base_model.gradient_checkpointing_enable()
+    base_model.config.use_cache = bool(args.use_cache)
+
+    if args.gradient_checkpointing:
+        base_model.gradient_checkpointing_enable()
+    else:
+        base_model.gradient_checkpointing_disable()
 
     if args.resume_from_checkpoint:
         model = PeftModel.from_pretrained(base_model, args.resume_from_checkpoint, is_trainable=True)
