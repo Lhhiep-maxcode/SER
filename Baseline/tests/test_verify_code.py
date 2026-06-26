@@ -64,6 +64,16 @@ class CodeVerifierTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.error_type, "wrong_answer")
 
+    def test_passes_large_stdin_stdout_input(self):
+        large_input = ("x" * 1_000_001) + "\n"
+        result = verify_code_completion(
+            "import sys\ndata = sys.stdin.read().rstrip('\\n')\nprint(len(data))",
+            [json.dumps({"input": large_input, "output": "1000001\n"})],
+            test_type="stdin_stdout",
+            timeout_seconds=2.0,
+        )
+        self.assertTrue(result.passed)
+
 
 if __name__ == "__main__":
     unittest.main()

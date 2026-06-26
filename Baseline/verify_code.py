@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 
 _FENCE_RE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_MAX_PIPE_STDIN_CHARS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -118,13 +119,11 @@ def _verify_stdin_stdout(
         script_path.write_text(candidate, encoding="utf-8")
         for index, test_case in enumerate(test_cases):
             try:
-                proc = subprocess.run(
-                    [sys.executable, str(script_path)],
+                proc = _run_stdin_stdout_case(
+                    script_path,
+                    test_case["input"],
                     cwd=tmpdir,
-                    input=test_case["input"],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
                 return CodeVerificationResult(
@@ -198,6 +197,37 @@ def _outputs_match(actual: str, expected: str) -> bool:
     if actual_clean == expected_clean:
         return True
     return actual_clean.split() == expected_clean.split()
+
+
+def _run_stdin_stdout_case(
+    script_path: Path,
+    test_input: str,
+    *,
+    cwd: str,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(script_path)]
+    if len(test_input) <= _MAX_PIPE_STDIN_CHARS:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            input=test_input,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+
+    input_path = Path(cwd) / "_grpo_stdin.txt"
+    input_path.write_text(test_input, encoding="utf-8")
+    with input_path.open("r", encoding="utf-8") as stdin_handle:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=stdin_handle,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
 
 
 def _build_test_script(candidate: str, test_code: str) -> str:
