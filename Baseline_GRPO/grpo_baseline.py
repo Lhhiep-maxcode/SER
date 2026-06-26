@@ -135,14 +135,21 @@ def main() -> None:
                 for batch_index, batch in enumerate(epoch_iter):
                     if batch["input_ids"].shape[-1] >= args.max_length:
                         continue
+                    print()
+                    print("Starting to generate and score trajectories ...")
                     batch_start = time.time()
                     train_batch = generate_and_score_batch(model, tokenizer, batch, args, stats)
+                    gen_seconds = batch_start - time.time()
+                    print("===> Time passed by:", gen_seconds)
                     if not train_batch["messages"]:
                         continue
 
+                    print("Computing loss ...")
                     train_start = time.time()
                     loss_logs = train_on_batch(model, tokenizer, train_batch, optimizer, args, state)
                     train_seconds = time.time() - train_start
+                    print("===> Time passed by:", train_seconds)
+                    
                     state.used_items += train_batch["used_items"]
                     state.generated_groups += len(batch["rows"])
                     state.skipped_zero_std += train_batch["skipped_zero_std"]
@@ -166,8 +173,12 @@ def main() -> None:
                         loss_logs=loss_logs,
                         batch_seconds=time.time() - batch_start,
                         train_seconds=train_seconds,
+                        gen_seconds=gen_seconds
                     )
+                    print(log_data)
+                    print("Writing log to file ...")
                     log_handle.write(json.dumps(log_data) + "\n")
+                    print("Done one step")
                     log_handle.flush()
                     write_tensorboard_scalars(writer, log_data, state.accumulated_batches)
                     epoch_iter.set_postfix(
@@ -335,7 +346,7 @@ def generate_and_score_batch(model, tokenizer, batch: dict[str, Any], args, stat
             max_length=args.max_length,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            use_cache=bool(args.use_cache),
+            use_cache=bool(args.use_cache)
         )
     torch.cuda.synchronize()
     generate_seconds = time.time() - generate_start
@@ -589,7 +600,7 @@ def adapters_disabled(model):
     return nullcontext()
 
 
-def build_log_record(args, state, stats, *, epoch, batch_index, train_batch, loss_logs, batch_seconds, train_seconds):
+def build_log_record(args, state, stats, *, epoch, batch_index, train_batch, loss_logs, batch_seconds, train_seconds, gen_seconds):
     lengths = train_batch["completion_lengths"]
     mean_reward = mean(train_batch["rewards"]) if train_batch["rewards"] else 0.0
     return {
@@ -608,6 +619,7 @@ def build_log_record(args, state, stats, *, epoch, batch_index, train_batch, los
         "kl": loss_logs["kl"],
         "num_train_sequences": loss_logs["num_train_sequences"],
         "generate_time_cost": train_batch["generate_seconds"],
+        "gen_time_cost": gen_seconds,
         "train_time_cost": train_seconds,
         "batch_time_cost": batch_seconds,
         "mean_completion_length": float(mean(lengths)) if lengths else 0.0,
