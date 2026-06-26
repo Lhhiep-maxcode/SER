@@ -1,5 +1,5 @@
 model_dir: Qwen/Qwen3-8B
-dataset_path: Baseline/processed/dapo_taco/train
+dataset_path: Baseline_GRPO/processed/dapo_taco/train_balanced_bs2
 output_dir: Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b
 log_file: Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/train.jsonl
 resume_from_checkpoint: ""
@@ -43,6 +43,7 @@ code_timeout_seconds: 5.0
 save_steps: 500
 num_workers: 4
 seed: 42
+shuffle_dataset: false
 
 use_tensorboard: true
 tensorboard_log_dir: Baseline_GRPO/outputs/grpo_dapo_taco_qwen3_8b/tensorboard

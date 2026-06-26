@@ -37,6 +37,32 @@ the current FastGRPO script.
 The provided config enables code execution because code rewards run generated
 Python tests. Use it only in a trusted training environment.
 
+## Balanced Order
+
+If your processed train dataset is already randomly shuffled but you want
+deterministic no-shuffle batches with equal math/code exposure, build a balanced
+copy first:
+
+```bash
+python Baseline_GRPO/reorder_balanced_dataset.py \
+  --input_path Baseline_GRPO/processed/dapo_taco/train \
+  --output_path Baseline_GRPO/processed/dapo_taco/train_balanced_bs2 \
+  --batch_size 2 \
+  --drop_unbalanced_tail \
+  --overwrite
+```
+
+Then train with:
+
+```yaml
+dataset_path: Baseline_GRPO/processed/dapo_taco/train_balanced_bs2
+batch_size: 2
+shuffle_dataset: false
+```
+
+For `batch_size: 1`, exact balance inside a single batch is impossible; the
+script alternates math and code across consecutive batches instead.
+
 ## TensorBoard
 
 ```bash

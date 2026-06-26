@@ -84,6 +84,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "save_steps": 500,
     "num_workers": 4,
     "seed": 42,
+    "shuffle_dataset": True,
     "use_tensorboard": True,
     "tensorboard_log_dir": "Baseline_GRPO/outputs/grpo_dapo_taco/tensorboard",
 }
@@ -117,7 +118,7 @@ def main() -> None:
             enable_thinking=args.enable_thinking,
         ),
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=args.shuffle_dataset,
         num_workers=args.num_workers,
         drop_last=False,
     )
@@ -283,6 +284,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=defaults["save_steps"])
     parser.add_argument("--num_workers", type=int, default=defaults["num_workers"])
     parser.add_argument("--seed", type=int, default=defaults["seed"])
+    parser.add_argument("--shuffle_dataset", type=str_to_bool, nargs="?", const=True, default=defaults["shuffle_dataset"])
     parser.add_argument("--use_tensorboard", type=str_to_bool, nargs="?", const=True, default=defaults["use_tensorboard"])
     parser.add_argument("--tensorboard_log_dir", default=defaults["tensorboard_log_dir"])
 
@@ -292,6 +294,7 @@ def parse_args() -> argparse.Namespace:
     args.use_tensorboard = str_to_bool(args.use_tensorboard)
     args.gradient_checkpointing = str_to_bool(args.gradient_checkpointing)
     args.use_cache = str_to_bool(args.use_cache)
+    args.shuffle_dataset = str_to_bool(args.shuffle_dataset)
     if not args.model_dir:
         parser.error("model_dir is required. Set it in --config YAML or pass --model_dir.")
     return args
