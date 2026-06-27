@@ -1,0 +1,9 @@
+torch
+transformers
+peft
+datasets
+numpy
+tqdm
+pyyaml
+tensorboard
+sympy
