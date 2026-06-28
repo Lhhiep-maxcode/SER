@@ -8,6 +8,8 @@ use_tensorboard: true
 env_data_paths:
   math: SER-method/processed/dapo_taco/math
   code: SER-method/processed/dapo_taco/code
+batch_size: 8
+ensure_all_envs_per_step: true
 env_batch_size:
   math: 1
   code: 1
@@ -81,6 +83,7 @@ budget:
   utility_floor: 0.01
   cost_floor: 0.001
   min_probability: 0.1
+  utility_mode: reward
 
 save_steps: 500
 seed: 42

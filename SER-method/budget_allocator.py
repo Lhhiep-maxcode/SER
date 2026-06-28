@@ -31,13 +31,17 @@ class EnvironmentStats:
         self.last_cost_seconds = max(cost_seconds, 1e-6)
         self.updates += 1
 
-    def utility(self, floor: float) -> float:
+    def utility(self, floor: float, mode: str) -> float:
+        if mode == "reward":
+            if self.updates < 1:
+                return floor
+            return max(self.moving_reward, floor)
         if self.updates < 2:
             return floor
         return max(self.moving_reward - self.previous_reward, floor)
 
-    def ratio(self, floor: float, cost_floor: float) -> float:
-        return self.utility(floor) / max(self.moving_cost_seconds, cost_floor)
+    def ratio(self, floor: float, cost_floor: float, mode: str) -> float:
+        return self.utility(floor, mode) / max(self.moving_cost_seconds, cost_floor)
 
 
 class BudgetAllocator:
@@ -49,6 +53,7 @@ class BudgetAllocator:
         utility_floor: float = 0.01,
         cost_floor: float = 1e-3,
         min_probability: float = 0.1,
+        utility_mode: str = "reward",
         seed: int = 42,
     ) -> None:
         self.stats = {name: EnvironmentStats(name=name) for name in env_names}
@@ -56,12 +61,15 @@ class BudgetAllocator:
         self.utility_floor = utility_floor
         self.cost_floor = cost_floor
         self.min_probability = min_probability
+        if utility_mode not in {"reward", "gain"}:
+            raise ValueError("utility_mode must be 'reward' or 'gain'.")
+        self.utility_mode = utility_mode
         self.rng = random.Random(seed)
 
     def probabilities(self) -> dict[str, float]:
         names = list(self.stats)
         raw = {
-            name: self.stats[name].ratio(self.utility_floor, self.cost_floor)
+            name: self.stats[name].ratio(self.utility_floor, self.cost_floor, self.utility_mode)
             for name in names
         }
         total = sum(raw.values())
@@ -91,6 +99,39 @@ class BudgetAllocator:
     def weight(self, env_name: str) -> float:
         return self.probabilities().get(env_name, 0.0)
 
+    def allocation(self, total_budget: int, *, ensure_each: bool = True) -> dict[str, int]:
+        """Convert environment probabilities into integer sample counts."""
+
+        total_budget = int(total_budget)
+        if total_budget <= 0:
+            raise ValueError("total_budget must be positive.")
+
+        probs = self.probabilities()
+        names = list(probs)
+        counts = {name: 0 for name in names}
+        remaining = total_budget
+
+        if ensure_each and total_budget >= len(names):
+            counts = {name: 1 for name in names}
+            remaining -= len(names)
+
+        quotas = {name: probs[name] * remaining for name in names}
+        for name, quota in quotas.items():
+            add = int(quota)
+            counts[name] += add
+            remaining -= add
+
+        if remaining > 0:
+            ranked = sorted(
+                names,
+                key=lambda name: (quotas[name] - int(quotas[name]), probs[name], name),
+                reverse=True,
+            )
+            for name in ranked[:remaining]:
+                counts[name] += 1
+
+        return counts
+
     def update(self, env_name: str, *, reward: float, cost_seconds: float) -> None:
         self.stats[env_name].update(
             reward=reward,
@@ -105,7 +146,7 @@ class BudgetAllocator:
             logs[f"budget/{name}_probability"] = probs[name]
             logs[f"budget/{name}_moving_reward"] = stats.moving_reward
             logs[f"budget/{name}_moving_cost_seconds"] = stats.moving_cost_seconds
-            logs[f"budget/{name}_ratio"] = stats.ratio(self.utility_floor, self.cost_floor)
+            logs[f"budget/{name}_ratio"] = stats.ratio(self.utility_floor, self.cost_floor, self.utility_mode)
             logs[f"budget/{name}_updates"] = float(stats.updates)
         return logs
 

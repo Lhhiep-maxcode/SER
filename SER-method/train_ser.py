@@ -4,8 +4,7 @@ This is a research implementation aligned with the SER paper:
 
 - separate math/code environments,
 - vLLM/OpenAI-compatible trajectory critic for early accept/reject,
-- environment-aware budget allocation via utility/cost ratios,
-- asynchronous environment updates without a global environment barrier.
+- environment-aware mixed-batch allocation via utility/cost ratios.
 """
 
 from __future__ import annotations
@@ -44,8 +43,8 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from Baseline_GRPO.data_utils import load_processed_dataset, render_full_message, render_prompt  # noqa: E402
-from Baseline_GRPO.reward_utils import RewardStats, compute_reward  # noqa: E402
+from data_utils import load_processed_dataset, render_full_message, render_prompt  # noqa: E402
+from reward_utils import RewardStats, compute_reward  # noqa: E402
 from budget_allocator import BudgetAllocator  # noqa: E402
 from critic_client import CriticClient  # noqa: E402
 
@@ -61,7 +60,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "math": "SER-method/processed/dapo_taco/math",
         "code": "SER-method/processed/dapo_taco/code",
     },
+    "batch_size": None,
     "env_batch_size": {"math": 1, "code": 1},
+    "ensure_all_envs_per_step": True,
     "max_env_samples": {"math": None, "code": None},
     "shuffle_dataset": True,
     "num_workers": 2,
@@ -110,6 +111,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "utility_floor": 0.01,
         "cost_floor": 1e-3,
         "min_probability": 0.1,
+        "utility_mode": "reward",
     },
     "save_steps": 500,
     "seed": 42,
@@ -140,6 +142,7 @@ class CyclingLoader:
     def __init__(self, dataloader: DataLoader) -> None:
         self.dataloader = dataloader
         self.iterator = iter(dataloader)
+        self.buffer: list[dict[str, Any]] = []
 
     def next(self):
         try:
@@ -148,6 +151,16 @@ class CyclingLoader:
             self.iterator = iter(self.dataloader)
             return next(self.iterator)
 
+    def next_rows(self, count: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        while len(rows) < count:
+            if not self.buffer:
+                self.buffer.extend(self.next()["rows"])
+            needed = count - len(rows)
+            rows.extend(self.buffer[:needed])
+            del self.buffer[:needed]
+        return rows
+
 
 class TrainingState:
     def __init__(self) -> None:
@@ -155,6 +168,7 @@ class TrainingState:
         self.accumulated_batches = 0
         self.env_updates: dict[str, int] = {}
         self.start_time = time.time()
+        self.last_saved_step = 0
 
 
 def main() -> None:
@@ -173,7 +187,7 @@ def main() -> None:
     print_trainable_parameters(model)
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.target_lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.target_lr, betas=(0.9, 0.95), weight_decay=0.05)
     state = TrainingState()
     state.optimizer_steps = maybe_load_optimizer(args, optimizer)
     reward_stats = RewardStats()
@@ -185,6 +199,7 @@ def main() -> None:
         utility_floor=float(args.budget["utility_floor"]),
         cost_floor=float(args.budget["cost_floor"]),
         min_probability=float(args.budget["min_probability"]),
+        utility_mode=str(args.budget.get("utility_mode", "reward")),
         seed=args.seed,
     )
     critic = build_critic(args)
@@ -196,74 +211,93 @@ def main() -> None:
             total_iterations = (
                 args.max_steps * args.accumulation_steps
                 if args.max_steps is not None
-                else args.num_epochs * sum(len(loader.dataloader) for loader in loaders.values())
+                else args.num_epochs * estimate_epoch_iterations(loaders, args.batch_size)
             )
             progress = tqdm(range(total_iterations), desc="SER training")
             for iteration in progress:
-                env_name = allocator.select()
-                batch = loaders[env_name].next()
-                env_start = time.time()
-
-                rollout_batch = collect_ser_rollouts(
-                    model,
-                    tokenizer,
-                    batch["rows"],
-                    env_name,
-                    args,
-                    critic,
-                    reward_stats,
+                allocation = allocator.allocation(
+                    args.batch_size,
+                    ensure_each=bool(args.ensure_all_envs_per_step),
                 )
-                if not rollout_batch["messages"]:
-                    allocator.update(env_name, reward=0.0, cost_seconds=time.time() - env_start)
-                    continue
+                env_rollout_batches: dict[str, dict[str, Any]] = {}
+                env_seconds_by_name: dict[str, float] = {}
 
-                env_weight = allocator.weight(env_name)
-                loss_logs = train_on_batch(
-                    model,
-                    tokenizer,
-                    rollout_batch,
-                    optimizer,
-                    args,
-                    state,
-                    env_weight=env_weight,
-                )
-                if state.accumulated_batches % args.accumulation_steps == 0:
+                for env_name, sample_count in allocation.items():
+                    if sample_count <= 0:
+                        continue
+                    env_start = time.time()
+                    rows = loaders[env_name].next_rows(sample_count)
+                    env_rollout_batches[env_name] = collect_ser_rollouts(
+                        model,
+                        tokenizer,
+                        rows,
+                        env_name,
+                        args,
+                        critic,
+                        reward_stats,
+                    )
+                    env_seconds = time.time() - env_start
+                    env_seconds_by_name[env_name] = env_seconds
+                    rollout_rewards = env_rollout_batches[env_name]["rewards"]
+                    env_reward = mean(rollout_rewards) if rollout_rewards else 0.0
+                    allocator.update(env_name, reward=float(env_reward), cost_seconds=env_seconds)
+                    state.env_updates[env_name] = state.env_updates.get(env_name, 0) + 1
+
+                rollout_batch = merge_rollout_batches(env_rollout_batches)
+                did_backward = bool(rollout_batch["messages"])
+                if did_backward:
+                    loss_logs = train_on_batch(
+                        model,
+                        tokenizer,
+                        rollout_batch,
+                        optimizer,
+                        args,
+                        state,
+                        env_weight=1.0,
+                    )
+                else:
+                    loss_logs = {"loss": 0.0, "kl": 0.0, "num_train_sequences": 0.0}
+                if did_backward and state.accumulated_batches % args.accumulation_steps == 0:
                     if args.max_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     state.optimizer_steps += 1
 
-                env_seconds = time.time() - env_start
-                env_reward = mean(rollout_batch["rewards"]) if rollout_batch["rewards"] else 0.0
-                allocator.update(env_name, reward=float(env_reward), cost_seconds=env_seconds)
-                state.env_updates[env_name] = state.env_updates.get(env_name, 0) + 1
-
                 log_record = build_log_record(
                     args,
                     state,
-                    env_name=env_name,
-                    env_weight=env_weight,
+                    env_name="mixed",
+                    env_weight=1.0,
                     rollout_batch=rollout_batch,
                     loss_logs=loss_logs,
-                    env_seconds=env_seconds,
+                    env_seconds=sum(env_seconds_by_name.values()),
                     reward_stats=reward_stats,
                     allocator=allocator,
                     iteration=iteration,
+                    allocation=allocation,
+                    env_rollout_batches=env_rollout_batches,
+                    env_seconds_by_name=env_seconds_by_name,
                 )
                 log_handle.write(json.dumps(log_record) + "\n")
                 log_handle.flush()
                 write_tensorboard_scalars(writer, log_record, max(1, state.accumulated_batches))
                 progress.set_postfix(
-                    env=env_name,
+                    alloc=",".join(f"{name}:{count}" for name, count in allocation.items()),
                     step=state.optimizer_steps,
-                    reward=round(float(env_reward), 3),
+                    reward=round(float(log_record["mean_reward"]), 3),
                     accept=rollout_batch["early_accepts"],
                     reject=rollout_batch["early_rejects"],
                 )
 
-                if args.save_steps > 0 and state.optimizer_steps > 0 and state.optimizer_steps % args.save_steps == 0:
+                if (
+                    args.save_steps > 0
+                    and state.optimizer_steps > 0
+                    and state.optimizer_steps % args.save_steps == 0
+                    and state.optimizer_steps != state.last_saved_step
+                ):
                     save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                    state.last_saved_step = state.optimizer_steps
                 if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
                     save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
                     return
@@ -294,6 +328,11 @@ def build_environment_loaders(args, tokenizer) -> dict[str, CyclingLoader]:
         )
         loaders[env_name] = CyclingLoader(dataloader)
     return loaders
+
+
+def estimate_epoch_iterations(loaders: dict[str, CyclingLoader], batch_size: int) -> int:
+    total_rows = sum(len(loader.dataloader.dataset) for loader in loaders.values())
+    return max(1, math.ceil(total_rows / max(1, int(batch_size))))
 
 
 def collect_ser_rollouts(
@@ -531,6 +570,56 @@ def build_training_batch_from_rollouts(
     }
 
 
+def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    merged = {
+        "messages": [],
+        "rewards": [],
+        "advantages": [],
+        "completion_lengths": [],
+        "env_name": "mixed",
+        "generated_tokens": 0,
+        "early_accepts": 0,
+        "early_rejects": 0,
+        "verified": 0,
+        "verification_fraction": 0.0,
+        "rollout_fraction": 0.0,
+        "critic_calls": 0,
+        "critic_errors": 0,
+        "skipped_zero_std": 0,
+        "skipped_correct": 0,
+        "skipped_incorrect": 0,
+    }
+    total_rollouts = 0
+    rollout_fraction_sum = 0.0
+
+    for batch in env_rollout_batches.values():
+        merged["messages"].extend(batch["messages"])
+        merged["rewards"].extend(batch["rewards"])
+        merged["advantages"].extend(batch["advantages"])
+        merged["completion_lengths"].extend(batch["completion_lengths"])
+        for key in (
+            "generated_tokens",
+            "early_accepts",
+            "early_rejects",
+            "verified",
+            "critic_calls",
+            "critic_errors",
+            "skipped_zero_std",
+            "skipped_correct",
+            "skipped_incorrect",
+        ):
+            merged[key] += batch[key]
+
+        env_rollouts = len(batch["completion_lengths"])
+        total_rollouts += env_rollouts
+        rollout_fraction_sum += float(batch["rollout_fraction"]) * env_rollouts
+
+    if total_rollouts > 0:
+        merged["verification_fraction"] = float(merged["verified"]) / total_rollouts
+        merged["rollout_fraction"] = rollout_fraction_sum / total_rollouts
+    return merged
+
+
 def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, args, state: TrainingState, *, env_weight: float):
     input_ids, attention_mask, loss_mask = encode_messages_for_loss(tokenizer, train_batch["messages"], args.enable_thinking)
     sorted_items = sorted(
@@ -709,7 +798,22 @@ def build_critic(args) -> CriticClient:
     )
 
 
-def build_log_record(args, state, *, env_name, env_weight, rollout_batch, loss_logs, env_seconds, reward_stats, allocator, iteration):
+def build_log_record(
+    args,
+    state,
+    *,
+    env_name,
+    env_weight,
+    rollout_batch,
+    loss_logs,
+    env_seconds,
+    reward_stats,
+    allocator,
+    iteration,
+    allocation: dict[str, int] | None = None,
+    env_rollout_batches: dict[str, dict[str, Any]] | None = None,
+    env_seconds_by_name: dict[str, float] | None = None,
+):
     lengths = rollout_batch["completion_lengths"]
     record = {
         "iteration": iteration,
@@ -736,6 +840,21 @@ def build_log_record(args, state, *, env_name, env_weight, rollout_batch, loss_l
         "skipped_zero_std": float(rollout_batch["skipped_zero_std"]),
         "used_time_minutes": round((time.time() - state.start_time) / 60, 4),
     }
+    if allocation:
+        record.update({f"allocation/{key}": float(value) for key, value in allocation.items()})
+    if env_seconds_by_name:
+        record.update({f"env_seconds/{key}": float(value) for key, value in env_seconds_by_name.items()})
+    if env_rollout_batches:
+        for key, batch in env_rollout_batches.items():
+            env_lengths = batch["completion_lengths"]
+            record[f"env_reward/{key}"] = float(mean(batch["rewards"])) if batch["rewards"] else 0.0
+            record[f"env_generated_tokens/{key}"] = float(batch["generated_tokens"])
+            record[f"env_mean_completion_length/{key}"] = float(mean(env_lengths)) if env_lengths else 0.0
+            record[f"env_early_accepts/{key}"] = float(batch["early_accepts"])
+            record[f"env_early_rejects/{key}"] = float(batch["early_rejects"])
+            record[f"env_verified/{key}"] = float(batch["verified"])
+            record[f"env_critic_calls/{key}"] = float(batch["critic_calls"])
+            record[f"env_skipped_zero_std/{key}"] = float(batch["skipped_zero_std"])
     record.update({f"env_updates/{key}": float(value) for key, value in state.env_updates.items()})
     record.update(reward_stats.as_dict())
     record.update(allocator.as_dict())
@@ -830,6 +949,13 @@ def parse_args() -> argparse.Namespace:
     args = argparse.Namespace(**config)
     if not args.model_dir:
         parser.error("model_dir is required in config.")
+    if args.batch_size is None:
+        args.batch_size = sum(int(value or 0) for value in args.env_batch_size.values())
+        if args.batch_size <= 0:
+            args.batch_size = len(args.env_data_paths)
+    args.batch_size = int(args.batch_size)
+    if bool(args.ensure_all_envs_per_step) and args.batch_size < len(args.env_data_paths):
+        parser.error("batch_size must be >= number of environments when ensure_all_envs_per_step is true.")
     if not args.allow_code_execution:
         print("WARNING: code execution is disabled. Code environment rewards will fail unless early terminated.")
     return args

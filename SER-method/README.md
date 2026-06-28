@@ -7,9 +7,9 @@ Implemented components:
 
 - Separate math and code environments.
 - vLLM/OpenAI-compatible trajectory critic for speculative early accept/reject.
-- Environment-aware scheduling using utility/cost ratios.
-- Environment-specific updates as soon as a selected environment finishes,
-  without waiting for the other environment to complete a synchronized batch.
+- Environment-aware batch allocation using utility/cost ratios.
+- Every SER iteration can include all environments, with integer sample counts
+  such as math/code `4/4`, `5/3`, or `6/2`.
 - Same processed data schema, LoRA setup, rewards, and verifiers as
   `Baseline_GRPO`.
 
@@ -90,21 +90,49 @@ promising.
 
 ## Budget Allocation
 
-The scheduler maintains per-environment moving reward and moving rollout cost.
-It uses:
+The allocator maintains per-environment moving reward and moving rollout cost.
+For every SER iteration, it converts environment probabilities into integer
+sample counts for the total `batch_size`.
+
+With:
+
+```yaml
+batch_size: 8
+ensure_all_envs_per_step: true
+```
+
+the initial equal allocation is math/code `4/4`. If math receives a larger
+budget probability, the next mixed batches can become `5/3`, then `6/2`.
+
+By default, the utility uses moving reward:
+
+```text
+R_e = max(moving_reward, utility_floor) / max(cost_seconds, cost_floor)
+```
+
+If you want the older gain-style rule, set:
+
+```yaml
+budget:
+  utility_mode: gain
+```
+
+which uses:
 
 ```text
 R_e = max(delta_reward, utility_floor) / max(cost_seconds, cost_floor)
 ```
 
-and samples the next environment according to normalized `R_e`, with a minimum
-probability floor so neither math nor code starves.
+The final integer allocation also uses a probability floor and, when
+`ensure_all_envs_per_step` is true, at least one sample for each environment.
 
 Logged metrics include:
 
 ```text
 budget/math_probability
 budget/code_probability
+allocation/math
+allocation/code
 budget/*_moving_reward
 budget/*_moving_cost_seconds
 early_accepts
@@ -122,4 +150,3 @@ tensorboard \
   --logdir SER-method/outputs/ser_qwen3_8b_math_code/tensorboard \
   --port 6006
 ```
-
