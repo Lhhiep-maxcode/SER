@@ -10,6 +10,9 @@ Implemented components:
 - Environment-aware batch allocation using utility/cost ratios.
 - Every SER iteration can include all environments, with integer sample counts
   such as math/code `4/4`, `5/3`, or `6/2`.
+- Mixed-environment rollout generation: active trajectories from all allocated
+  environments share the same generation micro-batches.
+- Concurrent critic requests to a separately hosted vLLM critic.
 - Same processed data schema, LoRA setup, rewards, and verifiers as
   `Baseline_GRPO`.
 
@@ -50,6 +53,7 @@ critic:
   enabled: true
   base_url: http://127.0.0.1:8000
   model: /workspace/storage-shared/models/Qwen3-235B-A22B
+  concurrency: 16
 ```
 
 The critic receives only the task prompt and partial assistant trajectory. It is
@@ -69,6 +73,12 @@ python SER-method/train_ser.py \
 
 `--allow_code_execution` is needed when unresolved code trajectories reach full
 verification. Early accepted/rejected code trajectories skip verifier execution.
+
+`rollout_generation_batch_size` controls how many active trajectories are passed
+to `model.generate` at once. This pool is mixed across environments, so if one
+iteration allocates math/code `5/3` with `repeated_generate_nums: 8`, the active
+rollout pool contains `64` trajectories and generation chunks are taken from
+that shared pool.
 
 ## Thresholds
 

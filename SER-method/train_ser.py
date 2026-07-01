@@ -43,7 +43,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from data_utils import load_processed_dataset, render_full_message, render_prompt  # noqa: E402
+from data_utils import load_processed_dataset, render_prompt  # noqa: E402
 from reward_utils import RewardStats, compute_reward  # noqa: E402
 from budget_allocator import BudgetAllocator  # noqa: E402
 from critic_client import CriticClient  # noqa: E402
@@ -82,7 +82,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "epsilon": 0.1,
     "beta": 0.01,
     "rollout_chunk_tokens": 256,
-    "generation_micro_batch_size": 8,
+    "rollout_generation_batch_size": 8,
     "enable_thinking": True,
     "allow_code_execution": False,
     "code_timeout_seconds": 5.0,
@@ -101,6 +101,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_retries": 2,
         "max_prompt_chars": 6000,
         "temperature": 0.0,
+        "concurrency": 8,
     },
     "thresholds": {
         "math": {"accept": 0.9, "reject": 0.1, "min_tokens": 128, "check_every_tokens": 256},
@@ -120,6 +121,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 @dataclass
 class RolloutItem:
+    env_name: str
     row_index: int
     repeat_index: int
     row: dict[str, Any]
@@ -215,30 +217,44 @@ def main() -> None:
             )
             progress = tqdm(range(total_iterations), desc="SER training")
             for iteration in progress:
+
+                # === Environment-aware budget allocation ===
                 allocation = allocator.allocation(
                     args.batch_size,
                     ensure_each=bool(args.ensure_all_envs_per_step),
                 )
-                env_rollout_batches: dict[str, dict[str, Any]] = {}
-                env_seconds_by_name: dict[str, float] = {}
 
-                for env_name, sample_count in allocation.items():
-                    if sample_count <= 0:
-                        continue
-                    env_start = time.time()
-                    rows = loaders[env_name].next_rows(sample_count)
-                    env_rollout_batches[env_name] = collect_ser_rollouts(
-                        model,
-                        tokenizer,
-                        rows,
-                        env_name,
-                        args,
-                        critic,
-                        reward_stats,
-                    )
-                    env_seconds = time.time() - env_start
-                    env_seconds_by_name[env_name] = env_seconds
-                    rollout_rewards = env_rollout_batches[env_name]["rewards"]
+                rows_by_env = {
+                    env_name: loaders[env_name].next_rows(sample_count)
+                    for env_name, sample_count in allocation.items()
+                    if sample_count > 0
+                }   # {'code': [{...}, {...}, ...], 'math': [...]}
+                # ===========================================
+
+                print("Starting to generate and score trajectories ...")
+                rollout_start = time.time()
+                env_rollout_batches = collect_mixed_ser_rollouts(
+                    model,
+                    tokenizer,
+                    rows_by_env,
+                    args,
+                    critic,
+                    reward_stats,
+                )
+                # env_rollout_batches = {
+                #   'math': {'messages': [...], 'rewards': [...], 'advantages': [...], ...}, 
+                #   'code': {...},
+                #   ...
+                # }
+
+                rollout_seconds = time.time() - rollout_start
+                print("===> Time passed by:", round(rollout_seconds, 2), "seconds")
+
+                env_seconds_by_name = attribute_env_seconds(env_rollout_batches, rollout_seconds, equal=True)
+
+                for env_name, rollout_batch_for_env in env_rollout_batches.items():
+                    env_seconds = env_seconds_by_name.get(env_name, 0.0)
+                    rollout_rewards = rollout_batch_for_env["rewards"]
                     env_reward = mean(rollout_rewards) if rollout_rewards else 0.0
                     allocator.update(env_name, reward=float(env_reward), cost_seconds=env_seconds)
                     state.env_updates[env_name] = state.env_updates.get(env_name, 0) + 1
@@ -335,36 +351,59 @@ def estimate_epoch_iterations(loaders: dict[str, CyclingLoader], batch_size: int
     return max(1, math.ceil(total_rows / max(1, int(batch_size))))
 
 
-def collect_ser_rollouts(
+def rollout_generation_batch_size(args) -> int:
+    configured = args.rollout_generation_batch_size
+    return max(1, int(configured))
+
+
+def critic_concurrency(args) -> int:
+    return max(1, int(args.critic.get("concurrency", 1)))
+
+
+def collect_mixed_ser_rollouts(
     model,
     tokenizer,
-    rows: list[dict[str, Any]],
-    env_name: str,
+    rows_by_env: dict[str, list[dict[str, Any]]],
     args,
     critic: CriticClient,
     reward_stats: RewardStats,
-) -> dict[str, Any]:
-    items = initialize_rollout_items(tokenizer, rows, args)
+) -> dict[str, dict[str, Any]]:
+    items: list[RolloutItem] = []
+    for env_name, rows in rows_by_env.items():
+        # Init group rollout for each sample in all env
+        items.extend(initialize_rollout_items(tokenizer, rows, args, env_name=env_name))
+        # items = [RolloutItem(...), RolloutItem(...), ...] for all envs
+
+    # active stores indices of items need more generation.
     active = list(range(len(items)))
-    thresholds = args.thresholds[env_name]
-    generated_token_count = 0
-    critic_errors = 0
+    generated_token_count_by_env = {env_name: 0 for env_name in rows_by_env}
+    critic_errors_by_env = {env_name: 0 for env_name in rows_by_env}
+    generation_batch_size = rollout_generation_batch_size(args)
+    critic_max_concurrency = critic_concurrency(args)
 
     while active:
+        # Rollouts that are not finished in this pass are carried into the
+        # next chunk-generation round.
         next_active = []
+        pending_critic: list[dict[str, Any]] = []
         was_training = model.training
         model.eval()
         try:
-            for start in range(0, len(active), args.generation_micro_batch_size):
-                batch_indices = active[start : start + args.generation_micro_batch_size]
+            for start in range(0, len(active), generation_batch_size):
+                batch_indices = active[start : start + generation_batch_size]
+
+                # Drop trajectories that already reached the hard token limit.
                 remaining = [args.max_length - len(items[idx].token_ids) for idx in batch_indices]
                 batch_indices = [idx for idx, rem in zip(batch_indices, remaining) if rem > 0]
                 if not batch_indices:
                     continue
+
                 max_new_tokens = min(
                     args.rollout_chunk_tokens,
                     min(args.max_length - len(items[idx].token_ids) for idx in batch_indices),
                 )
+
+                # Consider using EAGLE speculative here
                 generated = generate_token_chunk(
                     model,
                     tokenizer,
@@ -376,55 +415,104 @@ def collect_ser_rollouts(
                 for idx, token_ids in zip(batch_indices, generated):
                     item = items[idx]
                     previous_len = len(item.token_ids)
-                    item.token_ids = token_ids
+                    item.token_ids = token_ids  # assign new token_ids with newly generated tokens
                     item.generated_tokens = max(0, len(item.token_ids) - len(item.prompt_ids))
-                    generated_token_count += max(0, len(item.token_ids) - previous_len)
+                    generated_token_count_by_env[item.env_name] = (
+                        generated_token_count_by_env.get(item.env_name, 0)
+                        + max(0, len(item.token_ids) - previous_len)
+                    )
 
                     completion = tokenizer.decode(item.completion_ids, skip_special_tokens=True)
                     finished = has_eos(item.completion_ids, tokenizer.eos_token_id) or len(item.token_ids) >= args.max_length
                     if finished:
+                        # Full rollout path: once generation naturally stops or
+                        # hits the limit, call the real environment verifier.
                         verify_rollout(item, completion, args, reward_stats)
                         continue
 
-                    if should_query_critic(item, thresholds):
+                    thresholds = args.thresholds[item.env_name]
+                    if should_query_critic(item, thresholds):   # check if the trajectory have enough token and divisible by check_every_tokens
+                        # Speculative path: ask the critic whether this partial
+                        # trajectory is already clearly good or clearly bad.
                         item.critic_calls += 1
-                        result = critic.score(
-                            task=str(item.row.get("task") or env_name),
-                            prompt_text=item.prompt_text,
-                            partial_completion=completion,
-                            env_name=env_name,
+                        pending_critic.append(
+                            {
+                                "idx": idx,
+                                "thresholds": thresholds,
+                                "request": {
+                                    "task": str(item.row.get("task") or item.env_name),
+                                    "prompt_text": item.prompt_text,
+                                    "partial_completion": completion,
+                                    "env_name": item.env_name,
+                                },
+                            }
                         )
-                        item.critic_score = result.score
-                        critic_errors += int(bool(result.error))
-                        if result.score >= float(thresholds["accept"]):
-                            item.reward = 1.0
-                            item.decision = "early_accept"
-                            continue
-                        if result.score <= float(thresholds["reject"]):
-                            item.reward = 0.0
-                            item.decision = "early_reject"
-                            continue
+                        continue
 
+                    # If not ready to query the critic, keep this trajectory active for the next chunk.
                     next_active.append(idx)
         finally:
             if was_training:
                 model.train()
+
+        if pending_critic:
+            results = critic.score(
+                [entry["request"] for entry in pending_critic],
+                max_concurrency=critic_max_concurrency,
+            )
+            for entry, result in zip(pending_critic, results):
+                idx = int(entry["idx"])
+                item = items[idx]
+                thresholds = entry["thresholds"]
+                item.critic_score = result.score
+                critic_errors_by_env[item.env_name] = (
+                    critic_errors_by_env.get(item.env_name, 0) + int(bool(result.error))
+                )
+                if result.score >= float(thresholds["accept"]):
+                    # Early accept saves the remaining rollout and verifier
+                    # cost, but gives reward 1 immediately.
+                    item.reward = 1.0
+                    item.decision = "early_accept"
+                    continue
+                elif result.score <= float(thresholds["reject"]):
+                    # Early reject also stops generation immediately, assigning
+                    # reward 0 without full verification.
+                    item.reward = 0.0
+                    item.decision = "early_reject"
+                    continue
+                else:
+                    next_active.append(idx)
+
         active = next_active
 
-    return build_training_batch_from_rollouts(
-        items,
-        tokenizer,
-        env_name,
-        generated_token_count,
-        critic_errors,
-        max_length=args.max_length,
-    )
+    env_batches: dict[str, dict[str, Any]] = {}
+    for env_name in rows_by_env:
+        # env_items = [RolloutItem(env_name,...), RolloutItem(env_name, ...), ...]
+        env_items = [item for item in items if item.env_name == env_name]
+
+        # Convert completed rollout items into trainable GRPO messages, rewards,
+        # group-normalized advantages, and logging statistics.
+        env_batches[env_name] = build_training_batch_from_rollouts(
+            env_items,
+            tokenizer,
+            env_name,
+            generated_token_count_by_env.get(env_name, 0),
+            critic_errors_by_env.get(env_name, 0),
+            max_length=args.max_length,
+        )
+    # {
+    #   'math': {'messages': [...], 'rewards': [...], 'advantages': [...], ...}, 
+    #   'code': {...}
+    # }
+    return env_batches
 
 
-def initialize_rollout_items(tokenizer, rows: list[dict[str, Any]], args) -> list[RolloutItem]:
+def initialize_rollout_items(tokenizer, rows: list[dict[str, Any]], args, *, env_name: str) -> list[RolloutItem]:
     items = []
     for row_index, row in enumerate(rows):
+        # apply chat template
         prompt_text = render_prompt(tokenizer, row["prompt"], enable_thinking=args.enable_thinking)
+        # encode to ids
         prompt_ids = tokenizer.encode(
             prompt_text,
             add_special_tokens=False,
@@ -434,6 +522,7 @@ def initialize_rollout_items(tokenizer, rows: list[dict[str, Any]], args) -> lis
         for repeat_index in range(args.repeated_generate_nums):
             items.append(
                 RolloutItem(
+                    env_name=env_name,
                     row_index=row_index,
                     repeat_index=repeat_index,
                     row=row,
@@ -511,6 +600,7 @@ def build_training_batch_from_rollouts(
     by_row: dict[int, list[RolloutItem]] = {}
     for item in items:
         by_row.setdefault(item.row_index, []).append(item)
+    # by_row = {0: [RolloutItem(row_0, repeat_0), RolloutItem(row_0, repeat_1), ...], 1: [RolloutItem(row_1, repeat_0), ...], ...}
 
     messages = []
     raw_rewards = []
@@ -536,6 +626,11 @@ def build_training_batch_from_rollouts(
             messages.append(message)
             raw_rewards.append(float(reward))
             advantages.append(float(advantage))
+    
+    # After this loop, we have:
+    # messages = [{'role': ..., 'content': ...}, {'role': ..., 'content': ...}, ...]
+    # rewards = [0.0, 1.0, 0.0, ...]
+    # advantages = [-0.5, 0.5, -0.5, ...]
 
     lengths = [item.generated_tokens for item in items]
     early_accepts = sum(1 for item in items if item.decision == "early_accept")
@@ -554,7 +649,7 @@ def build_training_batch_from_rollouts(
         "messages": messages,
         "rewards": raw_rewards,
         "advantages": advantages,
-        "completion_lengths": lengths,
+        "generated_lengths": lengths,
         "env_name": env_name,
         "generated_tokens": generated_token_count,
         "early_accepts": early_accepts,
@@ -575,14 +670,14 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
         "messages": [],
         "rewards": [],
         "advantages": [],
-        "completion_lengths": [],
+        "generated_lengths": [],
         "env_name": "mixed",
         "generated_tokens": 0,
         "early_accepts": 0,
         "early_rejects": 0,
         "verified": 0,
         "verification_fraction": 0.0,
-        "rollout_fraction": 0.0,
+        "rollout_fraction": 0.0,    # average generated tokens / max_possible_tokens across all rollouts
         "critic_calls": 0,
         "critic_errors": 0,
         "skipped_zero_std": 0,
@@ -596,7 +691,7 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
         merged["messages"].extend(batch["messages"])
         merged["rewards"].extend(batch["rewards"])
         merged["advantages"].extend(batch["advantages"])
-        merged["completion_lengths"].extend(batch["completion_lengths"])
+        merged["generated_lengths"].extend(batch["generated_lengths"])
         for key in (
             "generated_tokens",
             "early_accepts",
@@ -610,7 +705,7 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
         ):
             merged[key] += batch[key]
 
-        env_rollouts = len(batch["completion_lengths"])
+        env_rollouts = len(batch["generated_lengths"])
         total_rollouts += env_rollouts
         rollout_fraction_sum += float(batch["rollout_fraction"]) * env_rollouts
 
@@ -620,6 +715,26 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
     return merged
 
 
+def attribute_env_seconds(env_rollout_batches: dict[str, dict[str, Any]], total_seconds: float, equal: bool) -> dict[str, float]:
+    if not env_rollout_batches:
+        return {}
+
+    if not equal:
+        token_counts = {
+            env_name: float(max(0, batch.get("generated_tokens", 0)))
+            for env_name, batch in env_rollout_batches.items()
+        }
+        total_tokens = sum(token_counts.values())
+        if total_tokens > 0:
+            return {
+                env_name: float(total_seconds) * token_count / total_tokens
+                for env_name, token_count in token_counts.items()
+            }
+
+    equal_share = float(total_seconds) / len(env_rollout_batches)
+    return {env_name: equal_share for env_name in env_rollout_batches}
+
+
 def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, args, state: TrainingState, *, env_weight: float):
     input_ids, attention_mask, loss_mask = encode_messages_for_loss(tokenizer, train_batch["messages"], args.enable_thinking)
     sorted_items = sorted(
@@ -627,19 +742,25 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
         key=lambda item: len(item[0]),
     )
     chunks = make_training_chunks(sorted_items, args.max_training_token, args.max_training_padding_gap)
+    # chunks = [chunk_1, chunk_2, ...], where each chunk is a list of tuples (input_ids, attention_mask, loss_mask, advantage)
 
     total_loss = 0.0
     total_kl = 0.0
+    old_logps_by_chunk = [None for _ in chunks]
+    ref_logps_by_chunk = [None for _ in chunks]
     for _ in range(args.grpo_iteration_num):
-        for chunk in chunks:
+        for chunk_idx, chunk in enumerate(chunks):
             tensors = pad_chunk(chunk, tokenizer.pad_token_id, model_device(model))
             labels = tensors["input_ids"]
             mask = tensors["loss_mask"]
             reward = tensors["advantages"].unsqueeze(-1)
 
             if args.beta > 0:
-                with adapters_disabled(model), torch.no_grad():
-                    ref_logits = model(input_ids=tensors["input_ids"], attention_mask=tensors["attention_mask"]).logits
+                ref_logits = ref_logps_by_chunk[chunk_idx]
+                if ref_logits is None:
+                    with adapters_disabled(model), torch.no_grad():
+                        ref_logits = model(input_ids=tensors["input_ids"], attention_mask=tensors["attention_mask"]).logits
+                    ref_logps_by_chunk[chunk_idx] = ref_logits
                 ref_logps = gather_token_logps(ref_logits, labels).detach()
                 del ref_logits
             else:
@@ -647,7 +768,12 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
 
             outputs = model(input_ids=tensors["input_ids"], attention_mask=tensors["attention_mask"])
             logps = gather_token_logps(outputs.logits, labels)
-            old_logps = logps.detach()
+            old_logps = old_logps_by_chunk[chunk_idx]
+            if old_logps is None:
+                old_logps = logps.detach()
+            
+            old_logps_by_chunk[chunk_idx] = logps.detach()
+
             loss, kl = compute_grpo_loss(
                 logps=logps,
                 old_logps=old_logps,
@@ -656,7 +782,7 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
                 reward=reward,
                 epsilon=args.epsilon,
                 beta=args.beta,
-            )
+            )   # loss as sum of sequence in one chunk (group or anything)
             scaled_loss = (
                 loss
                 * float(env_weight)
@@ -674,22 +800,35 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
 
 
 def encode_messages_for_loss(tokenizer, messages: list[list[dict[str, str]]], enable_thinking: bool):
-    full_texts = [render_full_message(tokenizer, message) for message in messages]
-    tokenized = tokenizer(full_texts, padding=False, add_special_tokens=False)
-    input_ids = tokenized["input_ids"]
-    attention_mask = tokenized["attention_mask"]
+    input_ids = [
+        tokenizer.apply_chat_template(
+            message,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+        for message in messages
+    ]
+    attention_mask = [[1] * len(ids) for ids in input_ids]
     loss_mask = []
-    for message, full_ids in zip(messages, input_ids):
+    prompt_ids = []
+    for message in messages:
         try:
-            prompt_text = tokenizer.apply_chat_template(
+            ids = tokenizer.apply_chat_template(
                 message[:-1],
-                tokenize=False,
+                tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=enable_thinking,
             )
         except TypeError:
-            prompt_text = tokenizer.apply_chat_template(message[:-1], tokenize=False, add_generation_prompt=True)
-        prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=False))
+            ids = tokenizer.apply_chat_template(
+                message[:-1],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        prompt_ids.append(ids)
+
+    for prompt_id, full_ids in zip(prompt_ids, input_ids):
+        prompt_len = len(prompt_id)
         cur_mask = [0] * max(0, prompt_len - 1) + [1] * max(0, len(full_ids) - prompt_len + 1)
         cur_mask = cur_mask[: len(full_ids)]
         if len(cur_mask) < len(full_ids):
@@ -702,18 +841,21 @@ def make_training_chunks(items, max_training_token: int, max_padding_gap: int):
     chunks = []
     current = []
     current_max_len = 0
+    current_token_count = 0
     for item in items:
         seq_len = len(item[0])
-        can_add = (
-            (max(current_max_len, seq_len) * (len(current) + 1) <= max_training_token)
-            and ((seq_len - current_max_len) * len(current) <= max_padding_gap)
-        ) or not current
+        current_token_count += seq_len
+        current_max_len = max(current_max_len, seq_len)
+        can_add = not current or (
+            current_max_len * (len(current) + 1) <= max_training_token and
+            (current_max_len * (len(current) + 1) - current_token_count) <= max_padding_gap
+        )
         if not can_add:
             chunks.append(current)
             current = []
-            current_max_len = 0
+            current_max_len = seq_len
+            current_token_count = seq_len
         current.append(item)
-        current_max_len = max(current_max_len, seq_len)
     if current:
         chunks.append(current)
     return chunks
@@ -737,8 +879,8 @@ def pad_chunk(chunk, pad_token_id: int, device):
 
 
 def gather_token_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    logits = logits[:, :-1, :].float()
-    labels = labels[:, 1:].to(logits.device)
+    logits = logits[:, :-1, :].float()  # shape: (batch_size, seq_len - 1, vocab_size)
+    labels = labels[:, 1:].to(logits.device)    # shape: (batch_size, seq_len - 1)
     return torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(-1)).squeeze(-1)
 
 
@@ -793,6 +935,7 @@ def build_critic(args) -> CriticClient:
         timeout_seconds=float(cfg.get("timeout_seconds", 30.0)),
         max_retries=int(cfg.get("max_retries", 2)),
         max_prompt_chars=int(cfg.get("max_prompt_chars", 6000)),
+        max_new_tokens=int(cfg.get("max_new_tokens", 512)),
         temperature=float(cfg.get("temperature", 0.0)),
         enabled=bool(cfg.get("enabled", True)),
     )
@@ -956,6 +1099,8 @@ def parse_args() -> argparse.Namespace:
     args.batch_size = int(args.batch_size)
     if bool(args.ensure_all_envs_per_step) and args.batch_size < len(args.env_data_paths):
         parser.error("batch_size must be >= number of environments when ensure_all_envs_per_step is true.")
+    args.rollout_generation_batch_size = max(1, int(args.rollout_generation_batch_size))
+    args.critic["concurrency"] = max(1, int(args.critic.get("concurrency", 1)))
     if not args.allow_code_execution:
         print("WARNING: code execution is disabled. Code environment rewards will fail unless early terminated.")
     return args

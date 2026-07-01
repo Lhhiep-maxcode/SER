@@ -37,7 +37,7 @@ epsilon: 0.1
 beta: 0.01
 
 rollout_chunk_tokens: 256
-generation_micro_batch_size: 8
+rollout_generation_batch_size: 32
 enable_thinking: true
 allow_code_execution: false
 code_timeout_seconds: 10.0
@@ -65,6 +65,8 @@ critic:
   max_retries: 2
   max_prompt_chars: 6000
   temperature: 0.0
+  concurrency: 16
+  max_new_tokens: 512
 
 thresholds:
   math:
