@@ -957,7 +957,7 @@ def build_log_record(
     env_rollout_batches: dict[str, dict[str, Any]] | None = None,
     env_seconds_by_name: dict[str, float] | None = None,
 ):
-    lengths = rollout_batch["completion_lengths"]
+    lengths = rollout_batch["generated_lengths"]
     record = {
         "iteration": iteration,
         "optimizer_step": state.optimizer_steps,
@@ -989,7 +989,7 @@ def build_log_record(
         record.update({f"env_seconds/{key}": float(value) for key, value in env_seconds_by_name.items()})
     if env_rollout_batches:
         for key, batch in env_rollout_batches.items():
-            env_lengths = batch["completion_lengths"]
+            env_lengths = batch["generated_lengths"]
             record[f"env_reward/{key}"] = float(mean(batch["rewards"])) if batch["rewards"] else 0.0
             record[f"env_generated_tokens/{key}"] = float(batch["generated_tokens"])
             record[f"env_mean_completion_length/{key}"] = float(mean(env_lengths)) if env_lengths else 0.0
