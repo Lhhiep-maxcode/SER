@@ -798,13 +798,23 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
     denom = max(1, len(chunks) * args.grpo_iteration_num)
     return {"loss": total_loss / denom, "kl": total_kl / denom, "num_train_sequences": float(len(train_batch["messages"]))}
 
+def as_token_ids(value):
+    if isinstance(value, dict):
+        value = value["input_ids"]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if value and isinstance(value[0], list):
+        value = value[0]
+    return list(value)
 
 def encode_messages_for_loss(tokenizer, messages: list[list[dict[str, str]]], enable_thinking: bool):
     input_ids = [
-        tokenizer.apply_chat_template(
-            message,
-            tokenize=True,
-            add_generation_prompt=False,
+        as_token_ids(
+            tokenizer.apply_chat_template(
+                message,
+                tokenize=True,
+                add_generation_prompt=False,
+            )
         )
         for message in messages
     ]
@@ -813,17 +823,21 @@ def encode_messages_for_loss(tokenizer, messages: list[list[dict[str, str]]], en
     prompt_ids = []
     for message in messages:
         try:
-            ids = tokenizer.apply_chat_template(
-                message[:-1],
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
+            ids = as_token_ids(
+                tokenizer.apply_chat_template(
+                    message[:-1],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
             )
         except TypeError:
-            ids = tokenizer.apply_chat_template(
-                message[:-1],
-                tokenize=True,
-                add_generation_prompt=True,
+            ids = as_token_ids(
+                tokenizer.apply_chat_template(
+                    message[:-1],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
             )
         prompt_ids.append(ids)
 
