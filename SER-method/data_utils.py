@@ -78,6 +78,12 @@ def render_prompt(tokenizer, prompt: list[dict[str, str]], *, enable_thinking: b
             add_generation_prompt=True,
         )
 
+def render_full_message(tokenizer, messages: list[dict[str, str]]) -> str:
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 
 def _json_cache_dir() -> Path:
     path = Path(".cache") / "baseline_grpo_json"

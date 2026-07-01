@@ -43,7 +43,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from data_utils import load_processed_dataset, render_prompt  # noqa: E402
+from data_utils import load_processed_dataset, render_full_message, render_prompt  # noqa: E402
 from reward_utils import RewardStats, compute_reward  # noqa: E402
 from budget_allocator import BudgetAllocator  # noqa: E402
 from critic_client import CriticClient  # noqa: E402
@@ -808,41 +808,27 @@ def as_token_ids(value):
     return list(value)
 
 def encode_messages_for_loss(tokenizer, messages: list[list[dict[str, str]]], enable_thinking: bool):
-    input_ids = [
-        as_token_ids(
-            tokenizer.apply_chat_template(
-                message,
-                tokenize=True,
-                add_generation_prompt=False,
-            )
-        )
-        for message in messages
-    ]
-    attention_mask = [[1] * len(ids) for ids in input_ids]
+    full_texts = [render_full_message(tokenizer, message) for message in messages]
+    tokenized = tokenizer(full_texts, padding=False, add_special_tokens=False)
+    input_ids = tokenized["input_ids"]
+    attention_mask = tokenized["attention_mask"]
     loss_mask = []
-    prompt_ids = []
-    for message in messages:
+    for message, full_ids in zip(messages, input_ids):
         try:
-            ids = as_token_ids(
-                tokenizer.apply_chat_template(
-                    message[:-1],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
-                )
+            prompt_text = tokenizer.apply_chat_template(
+                message[:-1],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
             )
         except TypeError:
-            ids = as_token_ids(
-                tokenizer.apply_chat_template(
-                    message[:-1],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                )
+            prompt_text = tokenizer.apply_chat_template(
+                message[:-1],
+                tokenize=False,
+                add_generation_prompt=True,
             )
-        prompt_ids.append(ids)
-
-    for prompt_id, full_ids in zip(prompt_ids, input_ids):
-        prompt_len = len(prompt_id)
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_len = len(prompt_ids)
         cur_mask = [0] * max(0, prompt_len - 1) + [1] * max(0, len(full_ids) - prompt_len + 1)
         cur_mask = cur_mask[: len(full_ids)]
         if len(cur_mask) < len(full_ids):
