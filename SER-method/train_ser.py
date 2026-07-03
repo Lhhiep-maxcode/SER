@@ -250,6 +250,7 @@ def main() -> None:
                 rollout_seconds = time.time() - rollout_start
                 print("===> Time passed by:", round(rollout_seconds, 2), "seconds")
 
+                # compute env_seconds for each env based on generated tokens
                 env_seconds_by_name = attribute_env_seconds(env_rollout_batches, rollout_seconds, equal=True)
 
                 for env_name, rollout_batch_for_env in env_rollout_batches.items():
@@ -295,6 +296,7 @@ def main() -> None:
                     env_rollout_batches=env_rollout_batches,
                     env_seconds_by_name=env_seconds_by_name,
                 )
+                print(log_record)
                 log_handle.write(json.dumps(log_record) + "\n")
                 log_handle.flush()
                 write_tensorboard_scalars(writer, log_record, max(1, state.accumulated_batches))
@@ -667,18 +669,18 @@ def build_training_batch_from_rollouts(
 
 def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dict[str, Any]:
     merged = {
-        "messages": [],
-        "rewards": [],
+        "messages": [],     # list of messages for each rollout
+        "rewards": [],      # list of rewards for each rollout 0/1
         "advantages": [],
-        "generated_lengths": [],
+        "generated_lengths": [],    # list of generated token counts for each rollout
         "env_name": "mixed",
-        "generated_tokens": 0,
-        "early_accepts": 0,
-        "early_rejects": 0,
+        "generated_tokens": 0,  #  total generated tokens across all rollouts
+        "early_accepts": 0,     # total number of rollouts that are accepted by critic
+        "early_rejects": 0,     # total number of rollouts that are rejected by critic
         "verified": 0,
         "verification_fraction": 0.0,
         "rollout_fraction": 0.0,    # average generated tokens / max_possible_tokens across all rollouts
-        "critic_calls": 0,
+        "critic_calls": 0,          # total number of critic calls of all rollouts
         "critic_errors": 0,
         "skipped_zero_std": 0,
         "skipped_correct": 0,
@@ -687,11 +689,11 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
     total_rollouts = 0
     rollout_fraction_sum = 0.0
 
-    for batch in env_rollout_batches.values():
-        merged["messages"].extend(batch["messages"])
-        merged["rewards"].extend(batch["rewards"])
-        merged["advantages"].extend(batch["advantages"])
-        merged["generated_lengths"].extend(batch["generated_lengths"])
+    for env_name, env_batch in env_rollout_batches.items():
+        merged["messages"].extend(env_batch["messages"])
+        merged["rewards"].extend(env_batch["rewards"])
+        merged["advantages"].extend(env_batch["advantages"])
+        merged["generated_lengths"].extend(env_batch["generated_lengths"])
         for key in (
             "generated_tokens",
             "early_accepts",
@@ -703,11 +705,11 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
             "skipped_correct",
             "skipped_incorrect",
         ):
-            merged[key] += batch[key]
+            merged[key] += env_batch[key]
 
-        env_rollouts = len(batch["generated_lengths"])
+        env_rollouts = len(env_batch["generated_lengths"])
         total_rollouts += env_rollouts
-        rollout_fraction_sum += float(batch["rollout_fraction"]) * env_rollouts
+        rollout_fraction_sum += float(env_batch["rollout_fraction"]) * env_rollouts
 
     if total_rollouts > 0:
         merged["verification_fraction"] = float(merged["verified"]) / total_rollouts
@@ -795,7 +797,7 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
             del tensors, labels, mask, reward, ref_logps, outputs, logps, old_logps, loss, kl, scaled_loss
 
     state.accumulated_batches += 1
-    denom = max(1, len(chunks) * args.grpo_iteration_num)
+    denom = max(1, len(train_batch["messages"]) * args.grpo_iteration_num)
     return {"loss": total_loss / denom, "kl": total_kl / denom, "num_train_sequences": float(len(train_batch["messages"]))}
 
 def as_token_ids(value):
@@ -897,7 +899,7 @@ def compute_grpo_loss(*, logps, old_logps, ref_logps, mask, reward, epsilon: flo
     denom = mask.sum(dim=-1).clamp_min(1.0)
     sequence_loss = token_loss.sum(dim=-1) / denom
     sequence_kl = (kl * mask).sum(dim=-1) / denom
-    return sequence_loss.sum(), sequence_kl.mean()
+    return sequence_loss.sum(), sequence_kl.sum()
 
 
 def build_model(args):
@@ -961,9 +963,8 @@ def build_log_record(
     record = {
         "iteration": iteration,
         "optimizer_step": state.optimizer_steps,
-        "accumulated_batches": state.accumulated_batches,
+        "accumulated_batches": state.accumulated_batches,   # number of iteration having meaningful gradient
         "env": env_name,
-        "env_weight": float(env_weight),
         "env_seconds": float(env_seconds),
         "loss": loss_logs["loss"],
         "kl": loss_logs["kl"],

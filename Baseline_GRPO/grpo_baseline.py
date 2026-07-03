@@ -480,7 +480,7 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
                 ref_logps_by_chunk[chunk_index] = ref_logps
 
     state.accumulated_batches += 1
-    denom = max(1, len(chunks) * args.grpo_iteration_num)
+    denom = max(1, len(train_batch["messages"]) * args.grpo_iteration_num)
     return {
         "loss": total_loss / denom,
         "kl": total_kl / denom,
@@ -586,7 +586,7 @@ def compute_grpo_loss(
     denom = mask.sum(dim=-1).clamp_min(1.0)
     sequence_loss = token_loss.sum(dim=-1) / denom      # sequence level
     sequence_kl = (kl * mask).sum(dim=-1) / denom      # sequence level
-    return sequence_loss.sum(), sequence_kl.mean()
+    return sequence_loss.sum(), sequence_kl.sum()
 
 
 def adapters_disabled(model):
