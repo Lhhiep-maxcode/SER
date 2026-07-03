@@ -134,6 +134,7 @@ class RolloutItem:
     critic_score: float | None = None
     critic_calls: int = 0
     verifier_called: bool = False
+    time_used: float = 0.0
 
     @property
     def completion_ids(self) -> list[int]:
@@ -251,10 +252,12 @@ def main() -> None:
                 print("===> Time passed by:", round(rollout_seconds, 2), "seconds")
 
                 # compute env_seconds for each env based on generated tokens
-                env_seconds_by_name = attribute_env_seconds(env_rollout_batches, rollout_seconds, equal=True)
+                max_real_seconds_for_a_rollout_by_name = {}
+                for env_name, batch in env_rollout_batches.items():
+                    max_real_seconds_for_a_rollout_by_name[env_name] = batch.get("max_real_seconds_for_a_rollout", 0.0)
 
                 for env_name, rollout_batch_for_env in env_rollout_batches.items():
-                    env_seconds = env_seconds_by_name.get(env_name, 0.0)
+                    env_seconds = 1.0
                     rollout_rewards = rollout_batch_for_env["rewards"]
                     env_reward = mean(rollout_rewards) if rollout_rewards else 0.0
                     allocator.update(env_name, reward=float(env_reward), cost_seconds=env_seconds)
@@ -263,14 +266,13 @@ def main() -> None:
                 rollout_batch = merge_rollout_batches(env_rollout_batches)
                 did_backward = bool(rollout_batch["messages"])
                 if did_backward:
+                    # backpropagate loss and compute gradients
                     loss_logs = train_on_batch(
                         model,
                         tokenizer,
                         rollout_batch,
-                        optimizer,
                         args,
                         state,
-                        env_weight=1.0,
                     )
                 else:
                     loss_logs = {"loss": 0.0, "kl": 0.0, "num_train_sequences": 0.0}
@@ -285,16 +287,14 @@ def main() -> None:
                     args,
                     state,
                     env_name="mixed",
-                    env_weight=1.0,
                     rollout_batch=rollout_batch,
                     loss_logs=loss_logs,
-                    env_seconds=sum(env_seconds_by_name.values()),
+                    rollout_seconds=rollout_seconds,
                     reward_stats=reward_stats,
                     allocator=allocator,
                     iteration=iteration,
                     allocation=allocation,
                     env_rollout_batches=env_rollout_batches,
-                    env_seconds_by_name=env_seconds_by_name,
                 )
                 print(log_record)
                 log_handle.write(json.dumps(log_record) + "\n")
@@ -397,6 +397,8 @@ def collect_mixed_ser_rollouts(
                 # Drop trajectories that already reached the hard token limit.
                 remaining = [args.max_length - len(items[idx].token_ids) for idx in batch_indices]
                 batch_indices = [idx for idx, rem in zip(batch_indices, remaining) if rem > 0]
+                time_start = time.time()
+
                 if not batch_indices:
                     continue
 
@@ -430,9 +432,12 @@ def collect_mixed_ser_rollouts(
                         # Full rollout path: once generation naturally stops or
                         # hits the limit, call the real environment verifier.
                         verify_rollout(item, completion, args, reward_stats)
+                        item.time_used += (time.time() - time_start)
                         continue
 
                     thresholds = args.thresholds[item.env_name]
+                    item.time_used += (time.time() - time_start)
+
                     if should_query_critic(item, thresholds):   # check if the trajectory have enough token and divisible by check_every_tokens
                         # Speculative path: ask the critic whether this partial
                         # trajectory is already clearly good or clearly bad.
@@ -458,6 +463,8 @@ def collect_mixed_ser_rollouts(
                 model.train()
 
         if pending_critic:
+            time_start = time.time()
+
             results = critic.score(
                 [entry["request"] for entry in pending_critic],
                 max_concurrency=critic_max_concurrency,
@@ -475,14 +482,17 @@ def collect_mixed_ser_rollouts(
                     # cost, but gives reward 1 immediately.
                     item.reward = 1.0
                     item.decision = "early_accept"
+                    item.time_used += (time.time() - time_start)
                     continue
                 elif result.score <= float(thresholds["reject"]):
                     # Early reject also stops generation immediately, assigning
                     # reward 0 without full verification.
                     item.reward = 0.0
                     item.decision = "early_reject"
+                    item.time_used += (time.time() - time_start)
                     continue
                 else:
+                    item.time_used += (time.time() - time_start)
                     next_active.append(idx)
 
         active = next_active
@@ -529,6 +539,7 @@ def initialize_rollout_items(tokenizer, rows: list[dict[str, Any]], args, *, env
                     repeat_index=repeat_index,
                     row=row,
                     prompt_text=prompt_text,
+                    time_used=0.0,
                     prompt_ids=prompt_ids,
                     token_ids=list(prompt_ids),
                 )
@@ -607,6 +618,7 @@ def build_training_batch_from_rollouts(
     messages = []
     raw_rewards = []
     advantages = []
+    real_time_used = []
     skipped_zero_std = 0
     skipped_correct = 0
     skipped_incorrect = 0
@@ -628,6 +640,7 @@ def build_training_batch_from_rollouts(
             messages.append(message)
             raw_rewards.append(float(reward))
             advantages.append(float(advantage))
+            real_time_used.append(item.time_used)
     
     # After this loop, we have:
     # messages = [{'role': ..., 'content': ...}, {'role': ..., 'content': ...}, ...]
@@ -643,7 +656,7 @@ def build_training_batch_from_rollouts(
         max(1, max_length - len(item.prompt_ids))
         for item in items
     ]
-    rollout_fractions = [
+    token_rollout_fractions = [
         item.generated_tokens / max_tokens
         for item, max_tokens in zip(items, max_possible_new_tokens)
     ]
@@ -653,12 +666,14 @@ def build_training_batch_from_rollouts(
         "advantages": advantages,
         "generated_lengths": lengths,
         "env_name": env_name,
+        "real_seconds_for_a_rollout": real_time_used,
+        "max_real_seconds_for_a_rollout": max(real_time_used),
         "generated_tokens": generated_token_count,
         "early_accepts": early_accepts,
         "early_rejects": early_rejects,
         "verified": verified,
         "verification_fraction": verified / total,
-        "rollout_fraction": float(mean(rollout_fractions)) if rollout_fractions else 0.0,
+        "token_rollout_fraction": float(mean(token_rollout_fractions)) if token_rollout_fractions else 0.0,
         "critic_calls": sum(item.critic_calls for item in items),
         "critic_errors": critic_errors,
         "skipped_zero_std": skipped_zero_std,
@@ -679,7 +694,7 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
         "early_rejects": 0,     # total number of rollouts that are rejected by critic
         "verified": 0,
         "verification_fraction": 0.0,
-        "rollout_fraction": 0.0,    # average generated tokens / max_possible_tokens across all rollouts
+        "token_rollout_fraction": 0.0,    # average generated tokens / max_possible_tokens across all rollouts
         "critic_calls": 0,          # total number of critic calls of all rollouts
         "critic_errors": 0,
         "skipped_zero_std": 0,
@@ -687,7 +702,7 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
         "skipped_incorrect": 0,
     }
     total_rollouts = 0
-    rollout_fraction_sum = 0.0
+    token_rollout_fraction_sum = 0.0
 
     for env_name, env_batch in env_rollout_batches.items():
         merged["messages"].extend(env_batch["messages"])
@@ -709,11 +724,11 @@ def merge_rollout_batches(env_rollout_batches: dict[str, dict[str, Any]]) -> dic
 
         env_rollouts = len(env_batch["generated_lengths"])
         total_rollouts += env_rollouts
-        rollout_fraction_sum += float(env_batch["rollout_fraction"]) * env_rollouts
+        token_rollout_fraction_sum += float(env_batch["token_rollout_fraction"]) * env_rollouts
 
     if total_rollouts > 0:
         merged["verification_fraction"] = float(merged["verified"]) / total_rollouts
-        merged["rollout_fraction"] = rollout_fraction_sum / total_rollouts
+        merged["token_rollout_fraction"] = token_rollout_fraction_sum / total_rollouts
     return merged
 
 
@@ -737,7 +752,7 @@ def attribute_env_seconds(env_rollout_batches: dict[str, dict[str, Any]], total_
     return {env_name: equal_share for env_name in env_rollout_batches}
 
 
-def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, args, state: TrainingState, *, env_weight: float):
+def train_on_batch(model, tokenizer, train_batch: dict[str, Any], args, state: TrainingState):
     input_ids, attention_mask, loss_mask = encode_messages_for_loss(tokenizer, train_batch["messages"], args.enable_thinking)
     sorted_items = sorted(
         zip(input_ids, attention_mask, loss_mask, train_batch["advantages"]),
@@ -787,7 +802,6 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], optimizer, arg
             )   # loss as sum of sequence in one chunk (group or anything)
             scaled_loss = (
                 loss
-                * float(env_weight)
                 / max(1, len(train_batch["messages"]))
                 / max(1, args.accumulation_steps)
             )
@@ -948,16 +962,14 @@ def build_log_record(
     state,
     *,
     env_name,
-    env_weight,
     rollout_batch,
     loss_logs,
-    env_seconds,
+    rollout_seconds,
     reward_stats,
     allocator,
     iteration,
     allocation: dict[str, int] | None = None,
     env_rollout_batches: dict[str, dict[str, Any]] | None = None,
-    env_seconds_by_name: dict[str, float] | None = None,
 ):
     lengths = rollout_batch["generated_lengths"]
     record = {
@@ -965,7 +977,7 @@ def build_log_record(
         "optimizer_step": state.optimizer_steps,
         "accumulated_batches": state.accumulated_batches,   # number of iteration having meaningful gradient
         "env": env_name,
-        "env_seconds": float(env_seconds),
+        "rollout_seconds": float(rollout_seconds),
         "loss": loss_logs["loss"],
         "kl": loss_logs["kl"],
         "num_train_sequences": loss_logs["num_train_sequences"],
@@ -973,12 +985,12 @@ def build_log_record(
         "generated_tokens": float(rollout_batch["generated_tokens"]),
         "mean_completion_length": float(mean(lengths)) if lengths else 0.0,
         "max_completion_length": float(max(lengths)) if lengths else 0.0,
-        "length_stdev": float(stdev(lengths)) if len(lengths) > 1 else 0.0,
+        # "length_stdev": float(stdev(lengths)) if len(lengths) > 1 else 0.0,
         "early_accepts": float(rollout_batch["early_accepts"]),
         "early_rejects": float(rollout_batch["early_rejects"]),
         "verified": float(rollout_batch["verified"]),
         "verification_fraction": float(rollout_batch["verification_fraction"]),
-        "rollout_fraction": float(rollout_batch["rollout_fraction"]),
+        "token_rollout_fraction": float(rollout_batch["token_rollout_fraction"]),
         "critic_calls": float(rollout_batch["critic_calls"]),
         "critic_errors": float(rollout_batch["critic_errors"]),
         "skipped_zero_std": float(rollout_batch["skipped_zero_std"]),
@@ -986,21 +998,22 @@ def build_log_record(
     }
     if allocation:
         record.update({f"allocation/{key}": float(value) for key, value in allocation.items()})
-    if env_seconds_by_name:
-        record.update({f"env_seconds/{key}": float(value) for key, value in env_seconds_by_name.items()})
     if env_rollout_batches:
         for key, batch in env_rollout_batches.items():
             env_lengths = batch["generated_lengths"]
+            real_seconds_for_a_rollout = batch["real_seconds_for_a_rollout"]
             record[f"env_reward/{key}"] = float(mean(batch["rewards"])) if batch["rewards"] else 0.0
             record[f"env_generated_tokens/{key}"] = float(batch["generated_tokens"])
-            record[f"env_mean_completion_length/{key}"] = float(mean(env_lengths)) if env_lengths else 0.0
+            record[f"env_mean_generated_length/{key}"] = float(mean(env_lengths)) if env_lengths else 0.0
+            record[f"env_mean_real_seconds_for_a_rollout/{key}"] = float(mean(real_seconds_for_a_rollout)) if real_seconds_for_a_rollout else 0.0
             record[f"env_early_accepts/{key}"] = float(batch["early_accepts"])
             record[f"env_early_rejects/{key}"] = float(batch["early_rejects"])
             record[f"env_verified/{key}"] = float(batch["verified"])
             record[f"env_critic_calls/{key}"] = float(batch["critic_calls"])
             record[f"env_skipped_zero_std/{key}"] = float(batch["skipped_zero_std"])
-    record.update({f"env_updates/{key}": float(value) for key, value in state.env_updates.items()})
-    record.update(reward_stats.as_dict())
+    # record.update({f"env_updates/{key}": float(value) for key, value in state.env_updates.items()})
+    for key, value in sorted(reward_stats.code_errors.items()):
+        record[f"code_errors/{key}"] = float(value)
     record.update(allocator.as_dict())
     return record
 

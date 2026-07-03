@@ -143,11 +143,11 @@ class BudgetAllocator:
         logs: dict[str, float] = {}
         probs = self.probabilities()
         for name, stats in self.stats.items():
-            logs[f"budget/{name}_probability"] = probs[name]
-            logs[f"budget/{name}_moving_reward"] = stats.moving_reward
-            logs[f"budget/{name}_moving_cost_seconds"] = stats.moving_cost_seconds
-            logs[f"budget/{name}_ratio"] = stats.ratio(self.utility_floor, self.cost_floor, self.utility_mode)
-            logs[f"budget/{name}_updates"] = float(stats.updates)
+            logs[f"alloc/{name}_probability"] = probs[name]
+            logs[f"alloc/{name}_moving_reward"] = stats.moving_reward
+            logs[f"alloc/{name}_moving_cost_seconds"] = stats.moving_cost_seconds
+            logs[f"alloc/{name}_ratio"] = stats.ratio(self.utility_floor, self.cost_floor, self.utility_mode)
+            logs[f"alloc/{name}_updates"] = float(stats.updates)
         return logs
 
 
