@@ -443,7 +443,15 @@ def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
         teacher_do_sample=bool(cfg.get("draft_warmup_teacher_do_sample", True)),
         include_prompt_only=bool(cfg.get("draft_warmup_include_prompt_only", False)),
     )
-    logs = speculative_engine.pretrain_from_token_batches(batches, max_steps=max_steps)
+    warmup_progress = tqdm(total=max_steps, desc="EAGLE draft warmup", dynamic_ncols=True)
+    try:
+        logs = speculative_engine.pretrain_from_token_batches(
+            batches,
+            max_steps=max_steps,
+            progress_bar=warmup_progress,
+        )
+    finally:
+        warmup_progress.close()
     print(f"EAGLE draft warmup logs: {logs}")
     if float(logs.get("draft_warmup_train_tokens", 0.0)) <= 0:
         print("Warning: EAGLE draft warmup did not find any assistant/reference tokens to train on.")

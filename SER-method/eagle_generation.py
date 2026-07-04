@@ -336,6 +336,7 @@ class EagleSpeculativeEngine:
         batches: list[tuple[torch.Tensor, torch.Tensor, list[int]]],
         *,
         max_steps: int,
+        progress_bar=None,
     ) -> dict[str, float]:
         """Align the draft model with the current target before SER rollouts.
 
@@ -379,6 +380,13 @@ class EagleSpeculativeEngine:
                 total_examples += len(examples)
                 total_train_tokens += sum(max(0, len(ids) - max(0, int(prefix_len)) - 1) for ids, _, prefix_len in examples)
                 steps += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(
+                        examples=total_examples,
+                        tokens=total_train_tokens,
+                        opt_steps=self.draft_optimizer_steps - optimizer_steps_before,
+                    )
 
         if was_training:
             self.target_model.train()
