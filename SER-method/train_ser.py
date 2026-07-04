@@ -91,6 +91,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_scratch_draft": True,
         "draft_lr": 1e-4,
         "draft_accumulation_steps": 1,
+        "draft_warmup_steps": 256,
+        "draft_warmup_batch_size": 1,
+        "draft_warmup_max_samples": 2048,
+        "draft_warmup_max_length": 2048,
+        "draft_warmup_include_prompt_only": True,
+        "draft_warmup_save": True,
         "verification_capacity": 160,
         "max_draft_token_length": 5,
         "min_draft_token_length": 3,
@@ -242,6 +248,7 @@ def main() -> None:
         seed=args.seed,
     )
     maybe_resume_allocator(args, allocator)
+    maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
     critic = build_critic(args)
     optimizer.zero_grad(set_to_none=True)
     install_signal_handler()
@@ -400,6 +407,163 @@ def build_environment_loaders(args, tokenizer) -> dict[str, CyclingLoader]:
         )
         loaders[env_name] = CyclingLoader(dataloader)
     return loaders
+
+
+def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer) -> None:
+    if speculative_engine is None or not speculative_engine.should_run_warmup():
+        return
+
+    cfg = args.speculative
+    max_steps = int(cfg.get("draft_warmup_steps", 0) or 0)
+    if max_steps <= 0:
+        return
+
+    print("=" * 60)
+    print("Starting EAGLE draft warmup before SER training")
+    print("=" * 60)
+    batches = iter_draft_warmup_batches(
+        args,
+        tokenizer,
+        max_steps=max_steps,
+        batch_size=max(1, int(cfg.get("draft_warmup_batch_size", 1))),
+        max_samples=int(cfg.get("draft_warmup_max_samples", max_steps)),
+        max_length=int(cfg.get("draft_warmup_max_length", args.max_length)),
+        include_prompt_only=bool(cfg.get("draft_warmup_include_prompt_only", True)),
+    )
+    logs = speculative_engine.pretrain_from_token_batches(batches, max_steps=max_steps)
+    print(f"EAGLE draft warmup logs: {logs}")
+    if writer is not None:
+        for key, value in logs.items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                writer.add_scalar(f"ser/speculative/{key}", float(value), 0)
+        writer.flush()
+    if bool(cfg.get("draft_warmup_save", True)):
+        output = Path(args.output_dir) / "draft_warmup"
+        output.mkdir(parents=True, exist_ok=True)
+        speculative_engine.save_checkpoint(output)
+        print(f"Saved EAGLE draft warmup state to {output / 'speculative.pt'}")
+
+
+def iter_draft_warmup_batches(
+    args,
+    tokenizer,
+    *,
+    max_steps: int,
+    batch_size: int,
+    max_samples: int,
+    max_length: int,
+    include_prompt_only: bool,
+):
+    rows = collect_draft_warmup_rows(args, max_samples=max_samples)
+    encoded: list[tuple[list[int], int]] = []
+    yielded = 0
+    for row in rows:
+        item = encode_draft_warmup_row(
+            tokenizer,
+            row,
+            enable_thinking=args.enable_thinking,
+            max_length=max_length,
+            include_prompt_only=include_prompt_only,
+        )
+        if item is None:
+            continue
+        encoded.append(item)
+        if len(encoded) >= batch_size:
+            yield pad_draft_warmup_batch(encoded, draft_warmup_pad_id(tokenizer))
+            yielded += 1
+            encoded = []
+            if yielded >= max_steps:
+                return
+    if encoded and yielded < max_steps:
+        yield pad_draft_warmup_batch(encoded, draft_warmup_pad_id(tokenizer))
+
+
+def collect_draft_warmup_rows(args, *, max_samples: int) -> list[dict[str, Any]]:
+    rows = []
+    env_items = list(args.env_data_paths.items())
+    if not env_items or max_samples <= 0:
+        return rows
+    per_env = max(1, math.ceil(max_samples / len(env_items)))
+    for env_name, path in env_items:
+        dataset = load_processed_dataset(path)
+        if bool(args.shuffle_dataset):
+            dataset = dataset.shuffle(seed=int(args.seed) + stable_env_seed_offset(f"draft-{env_name}"))
+        if per_env < len(dataset):
+            dataset = dataset.select(range(per_env))
+        for row in dataset:
+            rows.append(normalize_row(row))
+            if len(rows) >= max_samples:
+                break
+    random.Random(int(args.seed)).shuffle(rows)
+    return rows[:max_samples]
+
+
+def encode_draft_warmup_row(
+    tokenizer,
+    row: dict[str, Any],
+    *,
+    enable_thinking: bool,
+    max_length: int,
+    include_prompt_only: bool,
+) -> tuple[list[int], int] | None:
+    prompt = row.get("prompt") or []
+    answer = str(row.get("answer") or "").strip()
+    if answer:
+        # If a ground-truth answer exists, train the draft primarily on the
+        # assistant side.  The prefix length is shifted later by the EAGLE
+        # trainer because draft inputs use ids[1:] with target features[:-1].
+        message = deepcopy(prompt)
+        message.append({"role": "assistant", "content": answer})
+        text = render_full_message(tokenizer, message)
+        prompt_text = render_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+        prefix_len = len(tokenizer.encode(prompt_text, add_special_tokens=False))
+    else:
+        if not include_prompt_only:
+            return None
+        # Code rows often have verifier tests but no reference solution.  In
+        # that case, prompt-only warmup still aligns draft features on the same
+        # domain distribution before online rollout traces become available.
+        text = render_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+        prefix_len = 0
+
+    ids = tokenizer.encode(
+        text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_length,
+    )
+    if len(ids) < 4:
+        return None
+    if answer and prefix_len >= len(ids) - 2:
+        if not include_prompt_only:
+            return None
+        prefix_len = 0
+    return ids, min(prefix_len, len(ids) - 1)
+
+
+def draft_warmup_pad_id(tokenizer) -> int:
+    if tokenizer.pad_token_id is not None:
+        return int(tokenizer.pad_token_id)
+    if tokenizer.eos_token_id is not None:
+        return int(tokenizer.eos_token_id)
+    return 0
+
+
+def pad_draft_warmup_batch(items: list[tuple[list[int], int]], pad_token_id: int):
+    max_len = max(len(ids) for ids, _ in items)
+    input_ids = []
+    attention_mask = []
+    prefix_lengths = []
+    for ids, prefix_len in items:
+        pad_len = max_len - len(ids)
+        input_ids.append(ids + [pad_token_id] * pad_len)
+        attention_mask.append([1] * len(ids) + [0] * pad_len)
+        prefix_lengths.append(int(prefix_len))
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(attention_mask, dtype=torch.long),
+        prefix_lengths,
+    )
 
 
 def stable_env_seed_offset(env_name: str) -> int:

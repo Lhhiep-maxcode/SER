@@ -94,6 +94,7 @@ class EagleSpeculativeEngine:
     stats: EagleStats = field(default_factory=EagleStats)
     draft_accumulated_batches: int = 0
     draft_optimizer_steps: int = 0
+    loaded_from_checkpoint: bool = False
 
     @classmethod
     def build(cls, target_model, tokenizer, args) -> "EagleSpeculativeEngine | None":
@@ -140,6 +141,24 @@ class EagleSpeculativeEngine:
 
     def enabled(self) -> bool:
         return bool(self.cfg.get("enabled", False))
+
+    def should_run_warmup(self) -> bool:
+        """Return whether scratch-draft alignment should run before SER.
+
+        Online draft learning happens during rollout, but a scratch draft is so
+        unaligned that speculative acceptance can be poor at the beginning.  The
+        warmup stage mirrors FastGRPO's `train_draft.py`: freeze the target,
+        compute target hidden states, and train only the EAGLE draft to predict
+        the next target feature/logit distribution.
+        """
+
+        if self.optimizer is None or not bool(self.cfg.get("train_draft", True)):
+            return False
+        if self.loaded_from_checkpoint and not bool(self.cfg.get("draft_warmup_always", False)):
+            return False
+        if str(self.cfg.get("draft_adapter_path") or "").strip() and not bool(self.cfg.get("draft_warmup_always", False)):
+            return False
+        return int(self.cfg.get("draft_warmup_steps", 0) or 0) > 0
 
     def should_fallback(self, batch_size: int) -> bool:
         if not torch.cuda.is_available():
@@ -244,9 +263,82 @@ class EagleSpeculativeEngine:
             for input_ids, hidden_states, prefix_len in zip(ids, states, start_lengths)
             if len(input_ids) > 1
         ]
-        if not examples:
-            return
+        self.train_draft_examples(examples)
 
+    def pretrain_from_token_batches(
+        self,
+        batches: list[tuple[torch.Tensor, torch.Tensor, list[int]]],
+        *,
+        max_steps: int,
+    ) -> dict[str, float]:
+        """Align the draft model with the current target before SER rollouts.
+
+        Each batch contains full sequence tokens, attention masks, and prefix
+        lengths.  We run the target once with `output_hidden_states=True`, then
+        shift ids/features exactly like FastGRPO draft pretraining:
+
+            target hidden h_t + token embedding x_{t+1} -> predict h_{t+1}
+
+        The target forward pass is no-grad; only `self.wrapper.draft_model`
+        receives gradients.
+        """
+
+        if self.optimizer is None or max_steps <= 0:
+            return {"draft_warmup_steps": 0.0}
+
+        was_training = self.target_model.training
+        self.target_model.eval()
+        self.wrapper.draft_model.train()
+        steps = 0
+        total_feature = 0.0
+        total_logit = 0.0
+        start_time = time.time()
+        for input_ids, attention_mask, prefix_lengths in batches:
+            if steps >= max_steps:
+                break
+            input_ids = input_ids.to(self.wrapper.device)
+            attention_mask = attention_mask.to(self.wrapper.device)
+            with torch.no_grad():
+                outputs = self.target_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                hidden = outputs.hidden_states[-1]
+
+            examples = []
+            lengths = attention_mask.sum(dim=-1).tolist()
+            for row_idx, seq_len in enumerate(lengths):
+                seq_len = int(seq_len)
+                if seq_len < 4:
+                    continue
+                # Draft input is shifted: ids x_1..x_n train with target
+                # features h_0..h_{n-1}, so the draft predicts h_1..h_n.
+                ids = input_ids[row_idx, 1:seq_len].detach()
+                states = hidden[row_idx, : seq_len - 1, :].detach()
+                prefix_len = max(0, min(int(prefix_lengths[row_idx]) - 1, len(ids)))
+                examples.append((ids, states, prefix_len))
+
+            if examples:
+                logs = self.train_draft_examples(examples)
+                total_feature += float(logs.get("feature_loss", 0.0))
+                total_logit += float(logs.get("logit_loss", 0.0))
+                steps += 1
+
+        if was_training:
+            self.target_model.train()
+        return {
+            "draft_warmup_steps": float(steps),
+            "draft_warmup_seconds": float(time.time() - start_time),
+            "draft_warmup_feature_loss": total_feature / max(1, steps),
+            "draft_warmup_logit_loss": total_logit / max(1, steps),
+        }
+
+    def train_draft_examples(self, examples: list[tuple[torch.Tensor, torch.Tensor, int]]) -> dict[str, float]:
+        if not examples:
+            return {"feature_loss": 0.0, "logit_loss": 0.0, "did_step": 0.0}
         examples.sort(key=lambda item: int(item[0].shape[-1]))
         total_feature = 0.0
         total_logit = 0.0
@@ -282,6 +374,11 @@ class EagleSpeculativeEngine:
             self.draft_optimizer_steps += 1
             did_step = True
         self.stats.update_draft_loss(total_feature / max(1, len(examples)), total_logit / max(1, len(examples)), did_step)
+        return {
+            "feature_loss": total_feature / max(1, len(examples)),
+            "logit_loss": total_logit / max(1, len(examples)),
+            "did_step": float(did_step),
+        }
 
     def _draft_loss_for_chunk(self, chunk: list[tuple[torch.Tensor, torch.Tensor, int]]) -> tuple[torch.Tensor, torch.Tensor]:
         device = self.wrapper.device
@@ -363,6 +460,7 @@ class EagleSpeculativeEngine:
             self.optimizer.load_state_dict(state["draft_optimizer"])
         self.draft_accumulated_batches = int(state.get("draft_accumulated_batches", 0))
         self.draft_optimizer_steps = int(state.get("draft_optimizer_steps", 0))
+        self.loaded_from_checkpoint = True
         print(f"Loaded EAGLE speculative state from {path}")
 
     def pop_log_stats(self) -> dict[str, float]:

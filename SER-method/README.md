@@ -90,12 +90,15 @@ speculative:
   train_draft: true
   draft_adapter_path: ""
   allow_scratch_draft: true
+  draft_warmup_steps: 256
 ```
 
 If `draft_adapter_path` is empty, the draft model starts from scratch and is
-trained online from rollout traces. Checkpoints save `speculative.pt` beside the
-target adapter checkpoint, including the draft model and draft optimizer state.
-Speculative metrics are logged under `speculative/*` in JSONL and TensorBoard.
+first aligned to the target with a draft warmup pass over the processed SER
+datasets, then trained online from rollout traces. Checkpoints save
+`speculative.pt` beside the target adapter checkpoint, including the draft model
+and draft optimizer state. Speculative metrics are logged under `speculative/*`
+in JSONL and TensorBoard.
 
 ## Thresholds
 

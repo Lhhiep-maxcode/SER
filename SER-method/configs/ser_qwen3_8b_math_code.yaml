@@ -46,6 +46,12 @@ speculative:
   allow_scratch_draft: true
   draft_lr: 1.0e-4
   draft_accumulation_steps: 1
+  draft_warmup_steps: 256
+  draft_warmup_batch_size: 1
+  draft_warmup_max_samples: 2048
+  draft_warmup_max_length: 2048
+  draft_warmup_include_prompt_only: true
+  draft_warmup_save: true
   verification_capacity: 160
   max_draft_token_length: 5
   min_draft_token_length: 3
