@@ -152,7 +152,7 @@ def main() -> None:
                     print("Starting to generate and score trajectories ...")
                     batch_start = time.time()
                     train_batch = generate_and_score_batch(model, tokenizer, batch, args, stats)
-                    gen_seconds = batch_start - time.time()
+                    gen_seconds = time.time() - batch_start
                     print("===> Time passed by:", gen_seconds)
                     if not train_batch["messages"]:
                         continue
@@ -344,7 +344,7 @@ def parse_args() -> argparse.Namespace:
 def build_model(args: argparse.Namespace):
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
-        torch_dtype="auto",
+        dtype="auto",
         trust_remote_code=True,
     ).cuda()
     base_model.config.use_cache = bool(args.use_cache)

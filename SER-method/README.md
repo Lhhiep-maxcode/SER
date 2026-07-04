@@ -80,6 +80,23 @@ iteration allocates math/code `5/3` with `repeated_generate_nums: 8`, the active
 rollout pool contains `64` trajectories and generation chunks are taken from
 that shared pool.
 
+## EAGLE Speculative Generation
+
+EAGLE rollout acceleration is optional and disabled by default. To enable it:
+
+```yaml
+speculative:
+  enabled: true
+  train_draft: true
+  draft_adapter_path: ""
+  allow_scratch_draft: true
+```
+
+If `draft_adapter_path` is empty, the draft model starts from scratch and is
+trained online from rollout traces. Checkpoints save `speculative.pt` beside the
+target adapter checkpoint, including the draft model and draft optimizer state.
+Speculative metrics are logged under `speculative/*` in JSONL and TensorBoard.
+
 ## Thresholds
 
 The default code acceptance threshold is intentionally high:

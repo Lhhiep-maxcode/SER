@@ -47,6 +47,7 @@ from data_utils import load_processed_dataset, render_full_message, render_promp
 from reward_utils import RewardStats, compute_reward  # noqa: E402
 from budget_allocator import BudgetAllocator  # noqa: E402
 from critic_client import CriticClient  # noqa: E402
+from eagle_generation import build_eagle_engine  # noqa: E402
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -83,6 +84,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "beta": 0.01,
     "rollout_chunk_tokens": 256,
     "rollout_generation_batch_size": 8,
+    "speculative": {
+        "enabled": False,
+        "train_draft": True,
+        "draft_adapter_path": "",
+        "allow_scratch_draft": True,
+        "draft_lr": 1e-4,
+        "draft_accumulation_steps": 1,
+        "verification_capacity": 160,
+        "max_draft_token_length": 5,
+        "min_draft_token_length": 3,
+        "max_draft_k": 8,
+        "max_verification_num": 160,
+        "draft_token_length_c": 0.75,
+        "feature_loss_weight": 2.0,
+        "logit_loss_weight": 0.1,
+    },
     "enable_thinking": True,
     "allow_code_execution": False,
     "code_timeout_seconds": 5.0,
@@ -205,6 +222,7 @@ def main() -> None:
     model = build_model(args)
     print_trainable_parameters(model)
     model.train()
+    speculative_engine = build_eagle_engine(args, model, tokenizer)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.target_lr, betas=(0.9, 0.95), weight_decay=0.05)
     state = TrainingState()
@@ -262,6 +280,7 @@ def main() -> None:
                     args,
                     critic,
                     reward_stats,
+                    speculative_engine,
                 )
                 # env_rollout_batches = {
                 #   'math': {'messages': [...], 'rewards': [...], 'advantages': [...], ...}, 
@@ -324,6 +343,7 @@ def main() -> None:
                     iteration=iteration,
                     allocation=allocation,
                     env_rollout_batches=env_rollout_batches,
+                    speculative_engine=speculative_engine,
                 )
                 print(log_record)
                 print("Writing log to file ...")
@@ -345,10 +365,10 @@ def main() -> None:
                     and state.optimizer_steps % args.save_steps == 0
                     and state.optimizer_steps != state.last_saved_step
                 ):
-                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
+                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator, speculative_engine)
                     state.last_saved_step = state.optimizer_steps
                 if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
-                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
+                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator, speculative_engine)
                     return
 
         if state.accumulated_batches % args.accumulation_steps != 0:
@@ -357,7 +377,7 @@ def main() -> None:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             state.optimizer_steps += 1
-        save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
+        save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator, speculative_engine)
     finally:
         if writer is not None:
             writer.close()
@@ -407,6 +427,7 @@ def collect_mixed_ser_rollouts(
     args,
     critic: CriticClient,
     reward_stats: RewardStats,
+    speculative_engine=None,
 ) -> dict[str, dict[str, Any]]:
     items: list[RolloutItem] = []
     for env_name, rows in rows_by_env.items():
@@ -445,13 +466,13 @@ def collect_mixed_ser_rollouts(
                     min(args.max_length - len(items[idx].token_ids) for idx in batch_indices),
                 )
 
-                # Consider using EAGLE speculative here
                 generated = generate_token_chunk(
                     model,
                     tokenizer,
                     [items[idx].token_ids for idx in batch_indices],
                     max_new_tokens,
                     args,
+                    speculative_engine=speculative_engine,
                 )
 
                 for idx, token_ids in zip(batch_indices, generated):
@@ -585,8 +606,26 @@ def initialize_rollout_items(tokenizer, rows: list[dict[str, Any]], args, *, env
     return items
 
 
-def generate_token_chunk(model, tokenizer, token_lists: list[list[int]], max_new_tokens: int, args) -> list[list[int]]:
+def generate_token_chunk(
+    model,
+    tokenizer,
+    token_lists: list[list[int]],
+    max_new_tokens: int,
+    args,
+    *,
+    speculative_engine=None,
+) -> list[list[int]]:
     pad_id = tokenizer.pad_token_id
+    if speculative_engine is not None and speculative_engine.enabled():
+        return speculative_engine.generate(
+            token_lists,
+            max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            pad_token_id=pad_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
     max_len = max(len(tokens) for tokens in token_lists)
     input_ids = []
     attention_mask = []
@@ -705,7 +744,7 @@ def build_training_batch_from_rollouts(
         "generated_lengths": lengths,
         "env_name": env_name,
         "real_seconds_for_a_rollout": real_time_used,
-        "max_real_seconds_for_a_rollout": max(real_time_used),
+        "max_real_seconds_for_a_rollout": max(real_time_used) if real_time_used else 0.0,
         "generated_tokens": generated_token_count,
         "early_accepts": early_accepts,
         "early_rejects": early_rejects,
@@ -948,7 +987,7 @@ def compute_grpo_loss(*, logps, old_logps, ref_logps, mask, reward, epsilon: flo
 def build_model(args):
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
-        torch_dtype="auto",
+        dtype="auto",
         trust_remote_code=True,
     ).cuda()
     base_model.config.use_cache = bool(args.use_cache)
@@ -999,6 +1038,7 @@ def build_log_record(
     iteration,
     allocation: dict[str, int] | None = None,
     env_rollout_batches: dict[str, dict[str, Any]] | None = None,
+    speculative_engine=None,
 ):
     lengths = rollout_batch["generated_lengths"]
     record = {
@@ -1044,6 +1084,8 @@ def build_log_record(
     for key, value in sorted(reward_stats.code_errors.items()):
         record[f"code_errors/{key}"] = float(value)
     record.update(allocator.as_dict())
+    if speculative_engine is not None:
+        record.update(speculative_engine.pop_log_stats())
     return record
 
 
@@ -1055,6 +1097,7 @@ def save_checkpoint(
     state: TrainingState,
     loaders: dict[str, CyclingLoader],
     allocator: BudgetAllocator,
+    speculative_engine=None,
 ) -> None:
     step = int(state.optimizer_steps)
     output = Path(args.output_dir) / f"step{step}"
@@ -1075,6 +1118,8 @@ def save_checkpoint(
         },
         output / "optimizer.pt",
     )
+    if speculative_engine is not None:
+        speculative_engine.save_checkpoint(output)
     print(f"Saved checkpoint to {output}")
 
 

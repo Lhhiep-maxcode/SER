@@ -3,6 +3,7 @@ transformers
 peft
 datasets
 numpy
+pandas
 tqdm
 pyyaml
 tensorboard
