@@ -139,6 +139,43 @@ class BudgetAllocator:
             ema_alpha=self.ema_alpha,
         )
 
+    def state_dict(self) -> dict:
+        return {
+            "ema_alpha": float(self.ema_alpha),
+            "utility_floor": float(self.utility_floor),
+            "cost_floor": float(self.cost_floor),
+            "min_probability": float(self.min_probability),
+            "utility_mode": str(self.utility_mode),
+            "stats": {
+                name: {
+                    "moving_reward": float(stats.moving_reward),
+                    "previous_reward": float(stats.previous_reward),
+                    "moving_cost_seconds": float(stats.moving_cost_seconds),
+                    "updates": int(stats.updates),
+                    "last_reward": float(stats.last_reward),
+                    "last_cost_seconds": float(stats.last_cost_seconds),
+                }
+                for name, stats in self.stats.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            return
+        saved_stats = state.get("stats", {})
+        if not isinstance(saved_stats, dict):
+            return
+        for name, values in saved_stats.items():
+            if name not in self.stats or not isinstance(values, dict):
+                continue
+            stats = self.stats[name]
+            stats.moving_reward = float(values.get("moving_reward", stats.moving_reward))
+            stats.previous_reward = float(values.get("previous_reward", stats.previous_reward))
+            stats.moving_cost_seconds = float(values.get("moving_cost_seconds", stats.moving_cost_seconds))
+            stats.updates = int(values.get("updates", stats.updates))
+            stats.last_reward = float(values.get("last_reward", stats.last_reward))
+            stats.last_cost_seconds = float(values.get("last_cost_seconds", stats.last_cost_seconds))
+
     def as_dict(self) -> dict[str, float]:
         logs: dict[str, float] = {}
         probs = self.probabilities()

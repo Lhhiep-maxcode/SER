@@ -146,6 +146,7 @@ class CyclingLoader:
         self.dataloader = dataloader
         self.iterator = iter(dataloader)
         self.buffer: list[dict[str, Any]] = []
+        self.rows_consumed = 0
 
     def next(self):
         try:
@@ -160,9 +161,24 @@ class CyclingLoader:
             if not self.buffer:
                 self.buffer.extend(self.next()["rows"])
             needed = count - len(rows)
-            rows.extend(self.buffer[:needed])
-            del self.buffer[:needed]
+            take = min(needed, len(self.buffer))
+            rows.extend(self.buffer[:take])
+            del self.buffer[:take]
+            self.rows_consumed += take
         return rows
+
+    def skip_rows(self, count: int) -> None:
+        remaining = max(0, int(count))
+        while remaining > 0:
+            if not self.buffer:
+                self.buffer.extend(self.next()["rows"])
+            take = min(remaining, len(self.buffer))
+            del self.buffer[:take]
+            self.rows_consumed += take
+            remaining -= take
+
+    def state_dict(self) -> dict[str, int]:
+        return {"rows_consumed": int(self.rows_consumed)}
 
 
 class TrainingState:
@@ -193,9 +209,11 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.target_lr, betas=(0.9, 0.95), weight_decay=0.05)
     state = TrainingState()
     state.optimizer_steps = maybe_load_optimizer(args, optimizer)
+    maybe_resume_training_state(args, state)
     reward_stats = RewardStats()
 
     loaders = build_environment_loaders(args, tokenizer)
+    maybe_resume_loaders(args, loaders)
     allocator = BudgetAllocator(
         list(loaders),
         ema_alpha=float(args.budget["ema_alpha"]),
@@ -205,6 +223,7 @@ def main() -> None:
         utility_mode=str(args.budget.get("utility_mode", "reward")),
         seed=args.seed,
     )
+    maybe_resume_allocator(args, allocator)
     critic = build_critic(args)
     optimizer.zero_grad(set_to_none=True)
     install_signal_handler()
@@ -314,10 +333,10 @@ def main() -> None:
                     and state.optimizer_steps % args.save_steps == 0
                     and state.optimizer_steps != state.last_saved_step
                 ):
-                    save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
                     state.last_saved_step = state.optimizer_steps
                 if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
-                    save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
                     return
 
         if state.accumulated_batches % args.accumulation_steps != 0:
@@ -326,7 +345,7 @@ def main() -> None:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             state.optimizer_steps += 1
-        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+        save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
     finally:
         if writer is not None:
             writer.close()
@@ -336,6 +355,8 @@ def build_environment_loaders(args, tokenizer) -> dict[str, CyclingLoader]:
     loaders = {}
     for env_name, path in args.env_data_paths.items():
         dataset = load_processed_dataset(path, max_samples=args.max_env_samples.get(env_name))
+        generator = torch.Generator()
+        generator.manual_seed(int(args.seed) + stable_env_seed_offset(env_name))
         dataloader = DataLoader(
             dataset,
             batch_size=int(args.env_batch_size.get(env_name, 1)),
@@ -343,9 +364,14 @@ def build_environment_loaders(args, tokenizer) -> dict[str, CyclingLoader]:
             num_workers=args.num_workers,
             collate_fn=collate_rows,
             drop_last=False,
+            generator=generator,
         )
         loaders[env_name] = CyclingLoader(dataloader)
     return loaders
+
+
+def stable_env_seed_offset(env_name: str) -> int:
+    return sum((index + 1) * ord(char) for index, char in enumerate(str(env_name)))
 
 
 def estimate_epoch_iterations(loaders: dict[str, CyclingLoader], batch_size: int) -> int:
@@ -1009,12 +1035,34 @@ def build_log_record(
     return record
 
 
-def save_checkpoint(model, tokenizer, optimizer, args, step: int) -> None:
+def save_checkpoint(
+    model,
+    tokenizer,
+    optimizer,
+    args,
+    state: TrainingState,
+    loaders: dict[str, CyclingLoader],
+    allocator: BudgetAllocator,
+) -> None:
+    step = int(state.optimizer_steps)
     output = Path(args.output_dir) / f"step{step}"
     output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(output))
     tokenizer.save_pretrained(str(output))
-    torch.save({"optimizer": optimizer.state_dict(), "step": step}, output / "optimizer.pt")
+    torch.save(
+        {
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "accumulated_batches": int(state.accumulated_batches),
+            "env_updates": dict(state.env_updates),
+            "loader_state": {
+                env_name: loader.state_dict()
+                for env_name, loader in loaders.items()
+            },
+            "allocator_state": allocator.state_dict(),
+        },
+        output / "optimizer.pt",
+    )
     print(f"Saved checkpoint to {output}")
 
 
@@ -1028,6 +1076,50 @@ def maybe_load_optimizer(args, optimizer) -> int:
         print(f"Loaded optimizer state from {optimizer_path}")
         return int(state.get("step", 0))
     return 0
+
+
+def maybe_resume_training_state(args, state: TrainingState) -> None:
+    if not args.resume_from_checkpoint:
+        return
+    optimizer_path = Path(args.resume_from_checkpoint) / "optimizer.pt"
+    if not optimizer_path.exists():
+        return
+    checkpoint = torch.load(optimizer_path, map_location="cpu")
+    state.accumulated_batches = int(checkpoint.get("accumulated_batches", state.accumulated_batches))
+    env_updates = checkpoint.get("env_updates", state.env_updates)
+    if isinstance(env_updates, dict):
+        state.env_updates = {str(key): int(value) for key, value in env_updates.items()}
+    state.last_saved_step = int(state.optimizer_steps)
+
+
+def maybe_resume_loaders(args, loaders: dict[str, CyclingLoader]) -> None:
+    if not args.resume_from_checkpoint:
+        return
+    optimizer_path = Path(args.resume_from_checkpoint) / "optimizer.pt"
+    if not optimizer_path.exists():
+        return
+    state = torch.load(optimizer_path, map_location="cpu")
+    loader_state = state.get("loader_state", {})
+    if not isinstance(loader_state, dict):
+        return
+    for env_name, loader in loaders.items():
+        rows_consumed = int((loader_state.get(env_name) or {}).get("rows_consumed", 0))
+        if rows_consumed > 0:
+            loader.skip_rows(rows_consumed)
+            print(f"Resumed {env_name} loader after {rows_consumed} rows.")
+
+
+def maybe_resume_allocator(args, allocator: BudgetAllocator) -> None:
+    if not args.resume_from_checkpoint:
+        return
+    optimizer_path = Path(args.resume_from_checkpoint) / "optimizer.pt"
+    if not optimizer_path.exists():
+        return
+    checkpoint = torch.load(optimizer_path, map_location="cpu")
+    allocator_state = checkpoint.get("allocator_state")
+    if allocator_state:
+        allocator.load_state_dict(allocator_state)
+        print("Resumed allocator state.")
 
 
 def adapters_disabled(model):
