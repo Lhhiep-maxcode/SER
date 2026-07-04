@@ -249,9 +249,55 @@ class EagleSpeculativeEngine:
 
         self.stats.update_from_output(output, generated_count, time.time() - start_time)
         if self.optimizer is not None and bool(self.cfg.get("train_draft", True)):
-            self.train_draft_from_trace(output, start_lengths)
+            if bool(self.cfg.get("draft_train_from_target_hidden", True)):
+                # Online draft learning is anchored to target hidden states.
+                # Recompute the target features on the accepted prompt+rollout
+                # sequences, then train the draft against those teacher states.
+                self.train_draft_from_token_lists(results, start_lengths)
+            else:
+                self.train_draft_from_trace(output, start_lengths)
         del input_tensor, attention_mask
         return results
+
+    def generate_teacher_sequences(
+        self,
+        prompt_token_lists: list[list[int]],
+        max_new_tokens: int,
+        *,
+        temperature: float,
+        top_p: float,
+        pad_token_id: int,
+        eos_token_id: int | None,
+        do_sample: bool,
+    ) -> list[list[int]]:
+        """Generate target-model assistant responses for draft warmup.
+
+        Some RLVR rows, especially code rows, have tests but no supervised
+        answer text.  For those rows, we let the target produce a real
+        assistant continuation first.  The warmup step later computes target
+        hidden states on this full prompt+response sequence and trains only the
+        draft to imitate those target features.
+        """
+
+        if not prompt_token_lists:
+            return []
+        was_training = self.target_model.training
+        self.target_model.eval()
+        try:
+            return normal_generate(
+                self.target_model,
+                self.tokenizer,
+                prompt_token_lists,
+                max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                do_sample=do_sample,
+            )
+        finally:
+            if was_training:
+                self.target_model.train()
 
     def train_draft_from_trace(self, output: dict[str, Any], start_lengths: list[int]) -> None:
         states = output.get("all_draft_input_states")
@@ -264,6 +310,26 @@ class EagleSpeculativeEngine:
             if len(input_ids) > 1
         ]
         self.train_draft_examples(examples)
+
+    def train_draft_from_token_lists(self, token_lists: list[list[int]], prefix_lengths: list[int]) -> dict[str, float]:
+        """Train the draft from target hidden states on full sequences.
+
+        `token_lists` are complete prompt+completion sequences.  The target
+        forward pass is no-grad and produces the teacher feature stream; the
+        draft then learns the EAGLE transition:
+
+            target h_t + embedding(token_{t+1}) -> predict target h_{t+1}
+        """
+
+        if self.optimizer is None or not token_lists:
+            return {"feature_loss": 0.0, "logit_loss": 0.0, "did_step": 0.0}
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+        input_ids, attention_mask = pad_right(token_lists, pad_token_id=int(pad_id), device=self.wrapper.device)
+        examples = self.build_target_hidden_examples(input_ids, attention_mask, prefix_lengths)
+        del input_ids, attention_mask
+        return self.train_draft_examples(examples)
 
     def pretrain_from_token_batches(
         self,
@@ -292,39 +358,26 @@ class EagleSpeculativeEngine:
         steps = 0
         total_feature = 0.0
         total_logit = 0.0
+        total_examples = 0
+        total_train_tokens = 0
+        optimizer_steps_before = self.draft_optimizer_steps
         start_time = time.time()
         for input_ids, attention_mask, prefix_lengths in batches:
             if steps >= max_steps:
                 break
             input_ids = input_ids.to(self.wrapper.device)
             attention_mask = attention_mask.to(self.wrapper.device)
-            with torch.no_grad():
-                outputs = self.target_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                hidden = outputs.hidden_states[-1]
-
-            examples = []
-            lengths = attention_mask.sum(dim=-1).tolist()
-            for row_idx, seq_len in enumerate(lengths):
-                seq_len = int(seq_len)
-                if seq_len < 4:
-                    continue
-                # Draft input is shifted: ids x_1..x_n train with target
-                # features h_0..h_{n-1}, so the draft predicts h_1..h_n.
-                ids = input_ids[row_idx, 1:seq_len].detach()
-                states = hidden[row_idx, : seq_len - 1, :].detach()
-                prefix_len = max(0, min(int(prefix_lengths[row_idx]) - 1, len(ids)))
-                examples.append((ids, states, prefix_len))
+            examples = self.build_target_hidden_examples(input_ids, attention_mask, prefix_lengths)
 
             if examples:
-                logs = self.train_draft_examples(examples)
+                logs = self.train_draft_examples(
+                    examples,
+                    accumulation_steps=int(self.cfg.get("draft_warmup_accumulation_steps", 16)),
+                )
                 total_feature += float(logs.get("feature_loss", 0.0))
                 total_logit += float(logs.get("logit_loss", 0.0))
+                total_examples += len(examples)
+                total_train_tokens += sum(max(0, len(ids) - max(0, int(prefix_len)) - 1) for ids, _, prefix_len in examples)
                 steps += 1
 
         if was_training:
@@ -334,11 +387,62 @@ class EagleSpeculativeEngine:
             "draft_warmup_seconds": float(time.time() - start_time),
             "draft_warmup_feature_loss": total_feature / max(1, steps),
             "draft_warmup_logit_loss": total_logit / max(1, steps),
+            "draft_warmup_examples": float(total_examples),
+            "draft_warmup_train_tokens": float(total_train_tokens),
+            "draft_warmup_optimizer_steps": float(self.draft_optimizer_steps - optimizer_steps_before),
         }
 
-    def train_draft_examples(self, examples: list[tuple[torch.Tensor, torch.Tensor, int]]) -> dict[str, float]:
+    def build_target_hidden_examples(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prefix_lengths: list[int],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+        """Build shifted EAGLE examples from target hidden states.
+
+        We freeze the target forward with `torch.no_grad()`.  For a sequence
+        token_0..token_n, the draft receives token_1..token_n together with
+        target hidden_0..hidden_{n-1}; its feature prediction is supervised by
+        target hidden_1..hidden_n inside `_draft_loss_for_chunk`.
+        """
+
+        was_training = self.target_model.training
+        self.target_model.eval()
+        try:
+            with torch.no_grad():
+                outputs = self.target_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                hidden = outputs.hidden_states[-1]
+        finally:
+            if was_training:
+                self.target_model.train()
+
+        examples: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+        lengths = attention_mask.sum(dim=-1).tolist()
+        for row_idx, seq_len in enumerate(lengths):
+            seq_len = int(seq_len)
+            if seq_len < 4:
+                continue
+            ids = input_ids[row_idx, 1:seq_len].detach()
+            states = hidden[row_idx, : seq_len - 1, :].detach()
+            prefix_len = max(0, min(int(prefix_lengths[row_idx]) - 1, len(ids)))
+            examples.append((ids, states, prefix_len))
+        return examples
+
+    def train_draft_examples(
+        self,
+        examples: list[tuple[torch.Tensor, torch.Tensor, int]],
+        *,
+        accumulation_steps: int | None = None,
+    ) -> dict[str, float]:
         if not examples:
             return {"feature_loss": 0.0, "logit_loss": 0.0, "did_step": 0.0}
+        accumulation_steps = max(1, int(accumulation_steps or self.cfg.get("draft_accumulation_steps", 1)))
         examples.sort(key=lambda item: int(item[0].shape[-1]))
         total_feature = 0.0
         total_logit = 0.0
@@ -357,7 +461,7 @@ class EagleSpeculativeEngine:
             if not torch.isfinite(loss):
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            scaled = loss / max(1, total_examples) / max(1, int(self.cfg.get("draft_accumulation_steps", 1)))
+            scaled = loss / max(1, total_examples) / accumulation_steps
             scaled.backward()
             total_feature += float(feature_loss.detach().item())
             total_logit += float(logit_loss.detach().item())
@@ -365,7 +469,7 @@ class EagleSpeculativeEngine:
 
         self.draft_accumulated_batches += 1
         did_step = False
-        if self.draft_accumulated_batches % max(1, int(self.cfg.get("draft_accumulation_steps", 1))) == 0:
+        if self.draft_accumulated_batches % accumulation_steps == 0:
             max_grad_norm = float(self.cfg.get("draft_max_grad_norm", 1.0))
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.wrapper.draft_model.parameters(), max_grad_norm)
@@ -489,6 +593,19 @@ def pad_left(token_lists: list[list[int]], pad_token_id: int, device: torch.devi
     )
 
 
+def pad_right(token_lists: list[list[int]], pad_token_id: int, device: torch.device):
+    max_len = max(len(tokens) for tokens in token_lists)
+    input_ids, attention_mask = [], []
+    for tokens in token_lists:
+        pad_len = max_len - len(tokens)
+        input_ids.append(list(tokens) + [pad_token_id] * pad_len)
+        attention_mask.append([1] * len(tokens) + [0] * pad_len)
+    return (
+        torch.tensor(input_ids, device=device, dtype=torch.long),
+        torch.tensor(attention_mask, device=device, dtype=torch.long),
+    )
+
+
 def normal_generate(
     model,
     tokenizer,
@@ -499,13 +616,14 @@ def normal_generate(
     top_p: float,
     pad_token_id: int,
     eos_token_id: int | None,
+    do_sample: bool = True,
 ) -> list[list[int]]:
     input_tensor, mask_tensor, pad_lengths = pad_left(token_lists, pad_token_id, next(model.parameters()).device)
     with torch.inference_mode():
         outputs = model.generate(
             input_ids=input_tensor,
             attention_mask=mask_tensor,
-            do_sample=True,
+            do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
             max_new_tokens=max_new_tokens,

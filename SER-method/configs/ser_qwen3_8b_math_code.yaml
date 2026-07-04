@@ -48,10 +48,17 @@ speculative:
   draft_accumulation_steps: 1
   draft_warmup_steps: 256
   draft_warmup_batch_size: 1
+  draft_warmup_accumulation_steps: 16
   draft_warmup_max_samples: 2048
-  draft_warmup_max_length: 2048
-  draft_warmup_include_prompt_only: true
+  draft_warmup_max_length: 4096
+  draft_warmup_generate_target_responses: true
+  draft_warmup_generate_missing_answers: true
+  draft_warmup_teacher_batch_size: 4
+  draft_warmup_teacher_max_new_tokens: 512
+  draft_warmup_teacher_do_sample: true
+  draft_warmup_include_prompt_only: false
   draft_warmup_save: true
+  draft_train_from_target_hidden: true
   verification_capacity: 160
   max_draft_token_length: 5
   min_draft_token_length: 3

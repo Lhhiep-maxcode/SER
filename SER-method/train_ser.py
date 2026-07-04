@@ -93,10 +93,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "draft_accumulation_steps": 1,
         "draft_warmup_steps": 256,
         "draft_warmup_batch_size": 1,
+        "draft_warmup_accumulation_steps": 16,
         "draft_warmup_max_samples": 2048,
-        "draft_warmup_max_length": 2048,
-        "draft_warmup_include_prompt_only": True,
+        "draft_warmup_max_length": 4096,
+        "draft_warmup_generate_target_responses": True,
+        "draft_warmup_generate_missing_answers": True,
+        "draft_warmup_teacher_batch_size": 4,
+        "draft_warmup_teacher_max_new_tokens": 512,
+        "draft_warmup_teacher_do_sample": True,
+        "draft_warmup_include_prompt_only": False,
         "draft_warmup_save": True,
+        "draft_train_from_target_hidden": True,
         "verification_capacity": 160,
         "max_draft_token_length": 5,
         "min_draft_token_length": 3,
@@ -424,14 +431,24 @@ def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
     batches = iter_draft_warmup_batches(
         args,
         tokenizer,
+        speculative_engine=speculative_engine,
         max_steps=max_steps,
         batch_size=max(1, int(cfg.get("draft_warmup_batch_size", 1))),
         max_samples=int(cfg.get("draft_warmup_max_samples", max_steps)),
         max_length=int(cfg.get("draft_warmup_max_length", args.max_length)),
-        include_prompt_only=bool(cfg.get("draft_warmup_include_prompt_only", True)),
+        generate_target_responses=bool(cfg.get("draft_warmup_generate_target_responses", True)),
+        generate_missing_answers=bool(cfg.get("draft_warmup_generate_missing_answers", True)),
+        teacher_batch_size=max(1, int(cfg.get("draft_warmup_teacher_batch_size", 4))),
+        teacher_max_new_tokens=max(1, int(cfg.get("draft_warmup_teacher_max_new_tokens", 512))),
+        teacher_do_sample=bool(cfg.get("draft_warmup_teacher_do_sample", True)),
+        include_prompt_only=bool(cfg.get("draft_warmup_include_prompt_only", False)),
     )
     logs = speculative_engine.pretrain_from_token_batches(batches, max_steps=max_steps)
     print(f"EAGLE draft warmup logs: {logs}")
+    if float(logs.get("draft_warmup_train_tokens", 0.0)) <= 0:
+        print("Warning: EAGLE draft warmup did not find any assistant/reference tokens to train on.")
+    if float(logs.get("draft_warmup_optimizer_steps", 0.0)) <= 0:
+        print("Warning: EAGLE draft warmup completed without an optimizer step.")
     if writer is not None:
         for key, value in logs.items():
             if isinstance(value, (int, float)) and math.isfinite(float(value)):
@@ -448,15 +465,56 @@ def iter_draft_warmup_batches(
     args,
     tokenizer,
     *,
+    speculative_engine,
     max_steps: int,
     batch_size: int,
     max_samples: int,
     max_length: int,
+    generate_target_responses: bool,
+    generate_missing_answers: bool,
+    teacher_batch_size: int,
+    teacher_max_new_tokens: int,
+    teacher_do_sample: bool,
     include_prompt_only: bool,
 ):
     rows = collect_draft_warmup_rows(args, max_samples=max_samples)
     encoded: list[tuple[list[int], int]] = []
+    pending_teacher_prompts: list[list[int]] = []
+    pending_teacher_prefix_lengths: list[int] = []
     yielded = 0
+
+    def pop_batch():
+        nonlocal yielded
+        if len(encoded) < batch_size:
+            return None
+        batch_items = encoded[:batch_size]
+        del encoded[:batch_size]
+        yielded += 1
+        return pad_draft_warmup_batch(batch_items, draft_warmup_pad_id(tokenizer))
+
+    def flush_teacher_prompts() -> None:
+        if not pending_teacher_prompts:
+            return
+        max_new_tokens = min(
+            int(teacher_max_new_tokens),
+            max(1, min(max_length - len(ids) for ids in pending_teacher_prompts)),
+        )
+        generated = speculative_engine.generate_teacher_sequences(
+            pending_teacher_prompts,
+            max_new_tokens,
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            pad_token_id=draft_warmup_pad_id(tokenizer),
+            eos_token_id=tokenizer.eos_token_id,
+            do_sample=teacher_do_sample,
+        )
+        for ids, prefix_len in zip(generated, pending_teacher_prefix_lengths):
+            ids = list(ids)[:max_length]
+            if len(ids) >= 4 and prefix_len < len(ids) - 2:
+                encoded.append((ids, min(prefix_len, len(ids) - 1)))
+        pending_teacher_prompts.clear()
+        pending_teacher_prefix_lengths.clear()
+
     for row in rows:
         item = encode_draft_warmup_row(
             tokenizer,
@@ -465,15 +523,37 @@ def iter_draft_warmup_batches(
             max_length=max_length,
             include_prompt_only=include_prompt_only,
         )
-        if item is None:
-            continue
-        encoded.append(item)
-        if len(encoded) >= batch_size:
-            yield pad_draft_warmup_batch(encoded, draft_warmup_pad_id(tokenizer))
-            yielded += 1
-            encoded = []
+        should_generate_with_target = generate_target_responses or (item is None and generate_missing_answers)
+        if should_generate_with_target:
+            prompt_item = encode_draft_warmup_prompt(
+                tokenizer,
+                row,
+                enable_thinking=args.enable_thinking,
+                max_length=max_length,
+            )
+            if prompt_item is not None:
+                prompt_ids, prefix_len = prompt_item
+                pending_teacher_prompts.append(prompt_ids)
+                pending_teacher_prefix_lengths.append(prefix_len)
+                if len(pending_teacher_prompts) >= teacher_batch_size:
+                    flush_teacher_prompts()
+            elif item is not None:
+                encoded.append(item)
+        elif item is not None:
+            encoded.append(item)
+
+        while len(encoded) >= batch_size:
+            batch = pop_batch()
+            if batch is not None:
+                yield batch
             if yielded >= max_steps:
                 return
+
+    flush_teacher_prompts()
+    while len(encoded) >= batch_size and yielded < max_steps:
+        batch = pop_batch()
+        if batch is not None:
+            yield batch
     if encoded and yielded < max_steps:
         yield pad_draft_warmup_batch(encoded, draft_warmup_pad_id(tokenizer))
 
@@ -539,6 +619,32 @@ def encode_draft_warmup_row(
             return None
         prefix_len = 0
     return ids, min(prefix_len, len(ids) - 1)
+
+
+def encode_draft_warmup_prompt(
+    tokenizer,
+    row: dict[str, Any],
+    *,
+    enable_thinking: bool,
+    max_length: int,
+) -> tuple[list[int], int] | None:
+    """Encode a prompt that will be completed by the target for draft warmup."""
+
+    prompt = row.get("prompt") or []
+    if not prompt:
+        return None
+    prompt_text = render_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+    ids = tokenizer.encode(
+        prompt_text,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_length,
+    )
+    # Need at least a few positions for the target-generated assistant response;
+    # otherwise the draft warmup would again become prompt-only training.
+    if len(ids) < 2 or len(ids) >= max_length - 2:
+        return None
+    return ids, len(ids)
 
 
 def draft_warmup_pad_id(tokenizer) -> int:

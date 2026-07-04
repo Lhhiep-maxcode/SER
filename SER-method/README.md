@@ -91,14 +91,26 @@ speculative:
   draft_adapter_path: ""
   allow_scratch_draft: true
   draft_warmup_steps: 256
+  draft_warmup_accumulation_steps: 16
+  draft_warmup_max_length: 4096
+  draft_warmup_generate_target_responses: true
+  draft_warmup_generate_missing_answers: true
+  draft_warmup_teacher_max_new_tokens: 512
+  draft_warmup_include_prompt_only: false
+  draft_train_from_target_hidden: true
 ```
 
 If `draft_adapter_path` is empty, the draft model starts from scratch and is
 first aligned to the target with a draft warmup pass over the processed SER
 datasets, then trained online from rollout traces. Checkpoints save
 `speculative.pt` beside the target adapter checkpoint, including the draft model
-and draft optimizer state. Speculative metrics are logged under `speculative/*`
-in JSONL and TensorBoard.
+and draft optimizer state. By default, warmup asks the target model to generate
+assistant responses for the processed prompts, then computes target hidden
+states on the resulting prompt+response sequences. Online draft training also
+recomputes target hidden states on accepted rollout sequences by default.
+Prompt-only draft warmup is disabled unless `draft_warmup_include_prompt_only`
+is set to `true`.
+Speculative metrics are logged under `speculative/*` in JSONL and TensorBoard.
 
 ## Thresholds
 
