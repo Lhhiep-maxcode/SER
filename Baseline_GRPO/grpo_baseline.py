@@ -121,10 +121,15 @@ def main() -> None:
         shuffle=args.shuffle_dataset,
         num_workers=args.num_workers,
         drop_last=False,
+        generator=build_dataloader_generator(args),
     )
 
     state = TrainingState()
     state.optimizer_steps = resume_step
+    maybe_load_training_state(args, state)
+    resume_rows_to_skip = int(state.data_rows_consumed)
+    if resume_rows_to_skip > 0:
+        print(f"Resuming dataloader after {resume_rows_to_skip} consumed rows.")
     stats = RewardStats()
     optimizer.zero_grad(set_to_none=True)
     install_signal_handler()
@@ -134,6 +139,13 @@ def main() -> None:
             for epoch in range(args.num_epochs):
                 epoch_iter = tqdm(dataloader, desc=f"epoch {epoch + 1}/{args.num_epochs}")
                 for batch_index, batch in enumerate(epoch_iter):
+                    batch_rows = len(batch["rows"])
+                    if resume_rows_to_skip > 0:
+                        skipped = min(resume_rows_to_skip, batch_rows)
+                        resume_rows_to_skip -= skipped
+                        if skipped == batch_rows:
+                            continue
+                    state.data_rows_consumed += batch_rows
                     if batch["input_ids"].shape[-1] >= args.max_length:
                         continue
                     print()
@@ -189,10 +201,10 @@ def main() -> None:
                     )
 
                     if args.save_steps > 0 and state.optimizer_steps > 0 and state.optimizer_steps % args.save_steps == 0:
-                        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps, state=state)
 
                     if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
-                        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+                        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps, state=state)
                         return
 
         if state.accumulated_batches % args.accumulation_steps != 0:
@@ -202,7 +214,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             state.optimizer_steps += 1
 
-        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps)
+        save_checkpoint(model, tokenizer, optimizer, args, state.optimizer_steps, state=state)
     finally:
         if writer is not None:
             writer.close()
@@ -217,7 +229,36 @@ class TrainingState:
         self.skipped_incorrect = 0
         self.accumulated_batches = 0
         self.optimizer_steps = 0
+        self.data_rows_consumed = 0
         self.start_time = time.time()
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "used_items": int(self.used_items),
+            "generated_groups": int(self.generated_groups),
+            "skipped_zero_std": int(self.skipped_zero_std),
+            "skipped_correct": int(self.skipped_correct),
+            "skipped_incorrect": int(self.skipped_incorrect),
+            "accumulated_batches": int(self.accumulated_batches),
+            "optimizer_steps": int(self.optimizer_steps),
+            "data_rows_consumed": int(self.data_rows_consumed),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            return
+        for key in (
+            "used_items",
+            "generated_groups",
+            "skipped_zero_std",
+            "skipped_correct",
+            "skipped_incorrect",
+            "accumulated_batches",
+            "optimizer_steps",
+            "data_rows_consumed",
+        ):
+            if key in state:
+                setattr(self, key, int(state[key]))
 
 
 def parse_args() -> argparse.Namespace:
@@ -633,12 +674,15 @@ def build_log_record(args, state, stats, *, epoch, batch_index, train_batch, los
     }
 
 
-def save_checkpoint(model, tokenizer, optimizer, args, step: int) -> None:
+def save_checkpoint(model, tokenizer, optimizer, args, step: int, *, state: TrainingState | None = None) -> None:
     output = Path(args.output_dir) / f"step{step}"
     output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(output))
     tokenizer.save_pretrained(str(output))
-    torch.save({"optimizer": optimizer.state_dict(), "step": step}, output / "optimizer.pt")
+    payload = {"optimizer": optimizer.state_dict(), "step": step}
+    if state is not None:
+        payload["training_state"] = state.state_dict()
+    torch.save(payload, output / "optimizer.pt")
     print(f"Saved checkpoint to {output}")
 
 
@@ -652,6 +696,26 @@ def maybe_load_optimizer(args, optimizer) -> int:
         print(f"Loaded optimizer state from {optimizer_path}")
         return int(state.get("step", 0))
     return 0
+
+
+def maybe_load_training_state(args, state: TrainingState) -> None:
+    if not args.resume_from_checkpoint:
+        return
+    optimizer_path = Path(args.resume_from_checkpoint) / "optimizer.pt"
+    if not optimizer_path.exists():
+        return
+    checkpoint = torch.load(optimizer_path, map_location="cpu")
+    training_state = checkpoint.get("training_state", {})
+    if training_state:
+        state.load_state_dict(training_state)
+        state.optimizer_steps = int(checkpoint.get("step", state.optimizer_steps))
+        print(f"Loaded training/data state from {optimizer_path}")
+
+
+def build_dataloader_generator(args) -> torch.Generator:
+    generator = torch.Generator()
+    generator.manual_seed(int(args.seed))
+    return generator
 
 
 def load_yaml_config(path: str) -> dict[str, Any]:

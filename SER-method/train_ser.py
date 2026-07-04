@@ -251,8 +251,10 @@ def main() -> None:
                 }   # {'code': [{...}, {...}, ...], 'math': [...]}
                 # ===========================================
 
+                print()
                 print("Starting to generate and score trajectories ...")
                 rollout_start = time.time()
+
                 env_rollout_batches = collect_mixed_ser_rollouts(
                     model,
                     tokenizer,
@@ -284,6 +286,10 @@ def main() -> None:
 
                 rollout_batch = merge_rollout_batches(env_rollout_batches)
                 did_backward = bool(rollout_batch["messages"])
+
+                print("Computing loss ...")
+                train_start = time.time()
+
                 if did_backward:
                     # backpropagate loss and compute gradients
                     loss_logs = train_on_batch(
@@ -295,6 +301,10 @@ def main() -> None:
                     )
                 else:
                     loss_logs = {"loss": 0.0, "kl": 0.0, "num_train_sequences": 0.0}
+
+                train_seconds = time.time() - train_start
+                print("===> Time passed by:", train_seconds)
+
                 if did_backward and state.accumulated_batches % args.accumulation_steps == 0:
                     if args.max_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -316,7 +326,9 @@ def main() -> None:
                     env_rollout_batches=env_rollout_batches,
                 )
                 print(log_record)
+                print("Writing log to file ...")
                 log_handle.write(json.dumps(log_record) + "\n")
+                print("Done one step")
                 log_handle.flush()
                 write_tensorboard_scalars(writer, log_record, max(1, state.accumulated_batches))
                 progress.set_postfix(
