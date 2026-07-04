@@ -252,9 +252,9 @@ def main() -> None:
                 print("===> Time passed by:", round(rollout_seconds, 2), "seconds")
 
                 # compute env_seconds for each env based on generated tokens
-                max_real_seconds_for_a_rollout_by_name = {}
-                for env_name, batch in env_rollout_batches.items():
-                    max_real_seconds_for_a_rollout_by_name[env_name] = batch.get("max_real_seconds_for_a_rollout", 0.0)
+                # max_real_seconds_for_a_rollout_by_name = {}
+                # for env_name, batch in env_rollout_batches.items():
+                #     max_real_seconds_for_a_rollout_by_name[env_name] = batch.get("max_real_seconds_for_a_rollout", 0.0)
 
                 for env_name, rollout_batch_for_env in env_rollout_batches.items():
                     env_seconds = 1.0
@@ -773,13 +773,13 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], args, state: T
             reward = tensors["advantages"].unsqueeze(-1)
 
             if args.beta > 0:
-                ref_logits = ref_logps_by_chunk[chunk_idx]
-                if ref_logits is None:
+                ref_logps = ref_logps_by_chunk[chunk_idx]
+                if ref_logps is None:
                     with adapters_disabled(model), torch.no_grad():
                         ref_logits = model(input_ids=tensors["input_ids"], attention_mask=tensors["attention_mask"]).logits
-                    ref_logps_by_chunk[chunk_idx] = ref_logits
-                ref_logps = gather_token_logps(ref_logits, labels).detach()
-                del ref_logits
+                    ref_logps = gather_token_logps(ref_logits, labels).detach()
+                    ref_logps_by_chunk[chunk_idx] = ref_logps
+                    del ref_logits
             else:
                 ref_logps = None
 
@@ -813,15 +813,6 @@ def train_on_batch(model, tokenizer, train_batch: dict[str, Any], args, state: T
     state.accumulated_batches += 1
     denom = max(1, len(train_batch["messages"]) * args.grpo_iteration_num)
     return {"loss": total_loss / denom, "kl": total_kl / denom, "num_train_sequences": float(len(train_batch["messages"]))}
-
-def as_token_ids(value):
-    if isinstance(value, dict):
-        value = value["input_ids"]
-    if hasattr(value, "tolist"):
-        value = value.tolist()
-    if value and isinstance(value[0], list):
-        value = value[0]
-    return list(value)
 
 def encode_messages_for_loss(tokenizer, messages: list[list[dict[str, str]]], enable_thinking: bool):
     full_texts = [render_full_message(tokenizer, message) for message in messages]
