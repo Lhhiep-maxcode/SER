@@ -109,7 +109,7 @@ class DraftAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
 
-        dtype = config.torch_dtype
+        dtype = config.dtype
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, dtype=dtype)
@@ -162,7 +162,7 @@ class DraftAttention(nn.Module):
 class DraftMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        dtype = config.torch_dtype
+        dtype = config.dtype
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=dtype)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=dtype)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False, dtype=dtype)
@@ -181,7 +181,7 @@ class EagleFeatureFusion(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        dtype = config.torch_dtype
+        dtype = config.dtype
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=dtype)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=dtype)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False, dtype=dtype)
@@ -243,7 +243,7 @@ class DraftDecoderLayer(nn.Module):
 class EagleDraftModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dtype = config.torch_dtype
+        self.dtype = config.dtype
         self.hidden_size = config.hidden_size
         self.fs = EagleFeatureFusion(config)
         self.layers = nn.ModuleList(
@@ -423,17 +423,17 @@ class EagleDraftWrapper(nn.Module):
     def __init__(self, target_model, draft_layers: int = 1, adapter_path: str | None = None):
         super().__init__()
         config = deepcopy(target_model.config)
-        dtype = getattr(config, "torch_dtype", None)
+        dtype = getattr(config, "dtype", None)
         if dtype is None or isinstance(dtype, str):
             dtype = next(target_model.parameters()).dtype
-        config.torch_dtype = dtype
+        config.dtype = dtype
         config.num_hidden_layers = int(draft_layers)
         config.rope_scaling = None
         self.dtype = dtype
-        self.target_model = TargetModelView(target_model)
-        self.draft_model = EagleDraftModel(config)
-        self.embed_tokens = resolve_embed_tokens(target_model)
-        self.target_lm_head = resolve_lm_head(target_model)
+        self.target_model = TargetModelView(target_model)   # Wrapper of target model
+        self.draft_model = EagleDraftModel(config)          # Draft model adaptor architecture
+        self.embed_tokens = resolve_embed_tokens(target_model)  # Find and store embedding layer
+        self.target_lm_head = resolve_lm_head(target_model)     # Find and store LM head layer
         self.lm_head = DetachedLMHead(self.target_lm_head)
         if adapter_path:
             self.load_model(adapter_path)

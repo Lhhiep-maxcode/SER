@@ -109,7 +109,7 @@ class EagleSpeculativeEngine:
         if not adapter_path:
             print("WARNING: EAGLE speculative enabled with scratch draft initialization.")
 
-        wrapper = EagleDraftWrapper(
+        wrapper = EagleDraftWrapper(        # EAGLE draft model wrapper
             target_model,
             draft_layers=int(cfg.get("draft_num_layers", 1)),
             adapter_path=adapter_path or None,
@@ -450,7 +450,7 @@ class EagleSpeculativeEngine:
     ) -> dict[str, float]:
         if not examples:
             return {"feature_loss": 0.0, "logit_loss": 0.0, "did_step": 0.0}
-        accumulation_steps = max(1, int(accumulation_steps or self.cfg.get("draft_accumulation_steps", 1)))
+        accumulation_steps = max(1, int(accumulation_steps or self.cfg.get("draft_online_accumulation_steps", 1)))
         examples.sort(key=lambda item: int(item[0].shape[-1]))
         total_feature = 0.0
         total_logit = 0.0
