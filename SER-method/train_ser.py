@@ -91,7 +91,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "draft_lr": 1e-4,
         "draft_online_accumulation_steps": 1,
         "draft_warmup_steps": 256,
-        "draft_warmup_save_interval": 10,
         "draft_warmup_batch_size": 1,
         "draft_warmup_accumulation_steps": 16,
         "draft_warmup_max_samples": 2048,
@@ -103,6 +102,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "draft_warmup_teacher_do_sample": True,
         "draft_warmup_include_prompt_only": False,
         "draft_warmup_save": True,
+        "draft_warmup_save_interval": 10,
+        "draft_warmup_save_dir": "SER-method/outputs/ser_qwen3_8b/draft_warmup",
+        "draft_warmup_resume_from_checkpoint": "",
         "draft_train_from_target_hidden": True,
         "verification_capacity": 160,
         "max_draft_token_length": 5,
@@ -457,9 +459,9 @@ def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
         )
     finally:
         warmup_progress.close()
-    if float(logs.get("draft_warmup_total_train_tokens", 0.0)) <= 0:
+    if float(logs.get("draft_warmup_new_train_tokens", 0.0)) <= 0:
         print("Warning: EAGLE draft warmup did not find any assistant/reference tokens to train on.")
-    if float(logs.get("draft_warmup_total_optimizer_steps", 0.0)) <= 0:
+    if float(logs.get("draft_warmup_new_optimizer_steps", 0.0)) <= 0:
         print("Warning: EAGLE draft warmup completed without an optimizer step.")
     if writer is not None:
         for key, value in logs.items():
@@ -471,7 +473,7 @@ def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             print(f"  {key}: {value}")
     if bool(cfg.get("draft_warmup_save", True)):
-        output = Path(args.output_dir) / "draft_warmup"
+        output = Path(cfg.get("draft_warmup_save_dir", Path(args.output_dir) / "draft_warmup"))
         output.mkdir(parents=True, exist_ok=True)
         speculative_engine.save_checkpoint(output)
         print(f"Saved EAGLE draft warmup state to {output / 'speculative.pt'}")

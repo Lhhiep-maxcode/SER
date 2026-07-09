@@ -46,7 +46,6 @@ speculative:
   draft_lr: 1.0e-4
   draft_online_accumulation_steps: 1
   draft_warmup_steps: 256
-  draft_warmup_save_interval: 10
   draft_warmup_batch_size: 1
   draft_warmup_accumulation_steps: 16
   draft_warmup_max_samples: 2048
@@ -58,6 +57,9 @@ speculative:
   draft_warmup_teacher_do_sample: true
   draft_warmup_include_prompt_only: false
   draft_warmup_save: true
+  draft_warmup_save_interval: 10
+  draft_warmup_save_dir: SER-method/outputs/ser_qwen3_8b_math_code/draft_warmup
+  draft_warmup_resume_from_checkpoint: SER-method/outputs/ser_qwen3_8b_math_code/draft_warmup
   draft_train_from_target_hidden: true
   verification_capacity: 160
   max_draft_token_length: 5

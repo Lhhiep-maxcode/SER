@@ -95,12 +95,10 @@ class EagleSpeculativeEngine:
     draft_accumulated_batches: int = 0
     draft_optimizer_steps: int = 0
     loaded_from_checkpoint: bool = False
-    output_dir: str | Path = "./draft_warmup"
 
     @classmethod
     def build(cls, target_model, tokenizer, args) -> "EagleSpeculativeEngine | None":
         cfg = dict(getattr(args, "speculative", {}) or {})
-        output_dir = Path(getattr(args, "output_dir", "./")) / "draft_warmup"
         if not bool(cfg.get("enabled", False)):
             return None
 
@@ -130,9 +128,8 @@ class EagleSpeculativeEngine:
             max_training_padding_gap=int(args.max_training_padding_gap),
             wrapper=wrapper,
             optimizer=optimizer,
-            output_dir=output_dir,
         )
-        engine.maybe_load_checkpoint(getattr(args, "resume_from_checkpoint", ""))
+        engine.maybe_load_checkpoint(cfg.get("draft_warmup_resume_from_checkpoint", ""))
         return engine
 
     def enabled(self) -> bool:
@@ -488,8 +485,9 @@ class EagleSpeculativeEngine:
             self.draft_optimizer_steps += 1
             did_step = True
             if self.draft_optimizer_steps % int(self.cfg.get("draft_warmup_save_interval", 10)) == 0:
-                self.output_dir.mkdir(parents=True, exist_ok=True)
-                self.save_checkpoint(output_dir=self.output_dir)
+                output_dir = Path(self.cfg.get("draft_warmup_save_dir", "./draft_warmup"))
+                output_dir.mkdir(parents=True, exist_ok=True)
+                self.save_checkpoint(output_dir=output_dir)
         self.stats.update_draft_loss(total_feature / max(1, len(examples)), total_logit / max(1, len(examples)), did_step)
         return {
             "feature_loss": total_feature / max(1, len(examples)),
@@ -568,7 +566,7 @@ class EagleSpeculativeEngine:
     def maybe_load_checkpoint(self, checkpoint_dir: str | Path) -> None:
         if not checkpoint_dir:
             return
-        path = Path(checkpoint_dir) / "draft_warmup" / "speculative.pt"
+        path = Path(checkpoint_dir) / "speculative.pt"
         if not path.exists():
             return
         state = torch.load(path, map_location="cpu")
