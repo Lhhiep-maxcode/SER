@@ -95,24 +95,19 @@ class EagleSpeculativeEngine:
     draft_accumulated_batches: int = 0
     draft_optimizer_steps: int = 0
     loaded_from_checkpoint: bool = False
+    output_dir: str | Path = "./draft_warmup"
 
     @classmethod
     def build(cls, target_model, tokenizer, args) -> "EagleSpeculativeEngine | None":
         cfg = dict(getattr(args, "speculative", {}) or {})
+        output_dir = Path(getattr(args, "output_dir", "./")) / "draft_warmup"
         if not bool(cfg.get("enabled", False)):
             return None
-
-        adapter_path = str(cfg.get("draft_adapter_path") or "").strip()
-        allow_scratch = bool(cfg.get("allow_scratch_draft", True))
-        if not adapter_path and not allow_scratch:
-            raise ValueError("speculative.draft_adapter_path is required when allow_scratch_draft is false.")
-        if not adapter_path:
-            print("WARNING: EAGLE speculative enabled with scratch draft initialization.")
 
         wrapper = EagleDraftWrapper(        # EAGLE draft model wrapper
             target_model,
             draft_layers=int(cfg.get("draft_num_layers", 1)),
-            adapter_path=adapter_path or None,
+            adapter_path=None,
         ).to(next(target_model.parameters()).device)
         for param in wrapper.draft_model.parameters():
             param.requires_grad_(True)
@@ -135,6 +130,7 @@ class EagleSpeculativeEngine:
             max_training_padding_gap=int(args.max_training_padding_gap),
             wrapper=wrapper,
             optimizer=optimizer,
+            output_dir=output_dir,
         )
         engine.maybe_load_checkpoint(getattr(args, "resume_from_checkpoint", ""))
         return engine
@@ -143,22 +139,14 @@ class EagleSpeculativeEngine:
         return bool(self.cfg.get("enabled", False))
 
     def should_run_warmup(self) -> bool:
-        """Return whether scratch-draft alignment should run before SER.
-
-        Online draft learning happens during rollout, but a scratch draft is so
-        unaligned that speculative acceptance can be poor at the beginning.  The
-        warmup stage mirrors FastGRPO's `train_draft.py`: freeze the target,
-        compute target hidden states, and train only the EAGLE draft to predict
-        the next target feature/logit distribution.
-        """
-
-        if self.optimizer is None or not bool(self.cfg.get("train_draft", True)):
+        if not bool(self.cfg.get("train_draft", True)):
             return False
-        if self.loaded_from_checkpoint and not bool(self.cfg.get("draft_warmup_always", False)):
+        warmup_steps = int(self.cfg.get("draft_warmup_steps", 0) or 0)
+        if warmup_steps <= 0:
             return False
-        if str(self.cfg.get("draft_adapter_path") or "").strip() and not bool(self.cfg.get("draft_warmup_always", False)):
+        if self.loaded_from_checkpoint and self.draft_optimizer_steps >= warmup_steps:
             return False
-        return int(self.cfg.get("draft_warmup_steps", 0) or 0) > 0
+        return True
 
     def should_fallback(self, batch_size: int) -> bool:
         if not torch.cuda.is_available():
@@ -337,6 +325,7 @@ class EagleSpeculativeEngine:
         *,
         max_steps: int,
         progress_bar=None,
+        writer=None,
     ) -> dict[str, float]:
         """Align the draft model with the current target before SER rollouts.
 
@@ -356,19 +345,30 @@ class EagleSpeculativeEngine:
         was_training = self.target_model.training
         self.target_model.eval()
         self.wrapper.draft_model.train()
-        steps = 0
         total_feature = 0.0
         total_logit = 0.0
         total_examples = 0
         total_train_tokens = 0
         optimizer_steps_before = self.draft_optimizer_steps
         start_time = time.time()
-        for input_ids, attention_mask, prefix_lengths in batches:
-            if steps >= max_steps:
+        for iter, input_ids, attention_mask, prefix_lengths in enumerate(batches):
+            if iter < self.draft_accumulated_batches:
+                total_examples += len(input_ids)
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    examples=total_examples,
+                    tokens="Undefined",
+                    opt_steps=self.draft_optimizer_steps,
+                    feature_loss="Undefined",
+                    logit_loss="Undefined",
+                )
+                continue
+            if self.draft_optimizer_steps >= max_steps:
                 break
             input_ids = input_ids.to(self.wrapper.device)
             attention_mask = attention_mask.to(self.wrapper.device)
             examples = self.build_target_hidden_examples(input_ids, attention_mask, prefix_lengths)
+            # examples = [([id1, id2, ..., id_n], [h0, h1, ..., h_{n-1}], prefix_len), ...]
 
             if examples:
                 logs = self.train_draft_examples(
@@ -379,25 +379,27 @@ class EagleSpeculativeEngine:
                 total_logit += float(logs.get("logit_loss", 0.0))
                 total_examples += len(examples)
                 total_train_tokens += sum(max(0, len(ids) - max(0, int(prefix_len)) - 1) for ids, _, prefix_len in examples)
-                steps += 1
                 if progress_bar is not None:
                     progress_bar.update(1)
                     progress_bar.set_postfix(
                         examples=total_examples,
                         tokens=total_train_tokens,
-                        opt_steps=self.draft_optimizer_steps - optimizer_steps_before,
+                        opt_steps=self.draft_optimizer_steps,
+                        feature_loss=float(logs.get("feature_loss", 0.0)),
+                        logit_loss=float(logs.get("logit_loss", 0.0)),
                     )
+                if writer is not None:
+                    writer.add_scalar("ser/speculative/draft_warmup_feature_loss", float(logs.get("feature_loss", 0.0)), self.draft_accumulated_batches)
+                    writer.add_scalar("ser/speculative/draft_warmup_logit_loss", float(logs.get("logit_loss", 0.0)), self.draft_accumulated_batches)
+                    writer.add_scalar("ser/speculative/draft_warmup_train_tokens", float(total_train_tokens), self.draft_accumulated_batches)
 
         if was_training:
             self.target_model.train()
         return {
-            "draft_warmup_steps": float(steps),
             "draft_warmup_seconds": float(time.time() - start_time),
-            "draft_warmup_feature_loss": total_feature / max(1, steps),
-            "draft_warmup_logit_loss": total_logit / max(1, steps),
-            "draft_warmup_examples": float(total_examples),
-            "draft_warmup_train_tokens": float(total_train_tokens),
-            "draft_warmup_optimizer_steps": float(self.draft_optimizer_steps - optimizer_steps_before),
+            "draft_warmup_new_train_tokens": float(total_train_tokens),
+            "draft_warmup_new_optimizer_steps": float(self.draft_optimizer_steps - optimizer_steps_before),
+            "draft_warmup_total_steps": float(self.draft_optimizer_steps),
         }
 
     def build_target_hidden_examples(
@@ -485,6 +487,9 @@ class EagleSpeculativeEngine:
             self.optimizer.zero_grad(set_to_none=True)
             self.draft_optimizer_steps += 1
             did_step = True
+            if self.draft_optimizer_steps % int(self.cfg.get("draft_warmup_save_interval", 10)) == 0:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                self.save_checkpoint(output_dir=self.output_dir)
         self.stats.update_draft_loss(total_feature / max(1, len(examples)), total_logit / max(1, len(examples)), did_step)
         return {
             "feature_loss": total_feature / max(1, len(examples)),
@@ -563,7 +568,7 @@ class EagleSpeculativeEngine:
     def maybe_load_checkpoint(self, checkpoint_dir: str | Path) -> None:
         if not checkpoint_dir:
             return
-        path = Path(checkpoint_dir) / "speculative.pt"
+        path = Path(checkpoint_dir) / "draft_warmup" / "speculative.pt"
         if not path.exists():
             return
         state = torch.load(path, map_location="cpu")

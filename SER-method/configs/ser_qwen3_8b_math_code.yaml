@@ -42,11 +42,11 @@ rollout_generation_batch_size: 32
 speculative:
   enabled: false
   train_draft: true
-  draft_adapter_path: ""
   allow_scratch_draft: true
   draft_lr: 1.0e-4
   draft_online_accumulation_steps: 1
   draft_warmup_steps: 256
+  draft_warmup_save_interval: 10
   draft_warmup_batch_size: 1
   draft_warmup_accumulation_steps: 16
   draft_warmup_max_samples: 2048

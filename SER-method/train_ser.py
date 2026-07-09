@@ -87,11 +87,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "speculative": {
         "enabled": False,
         "train_draft": True,
-        "draft_adapter_path": "",
         "allow_scratch_draft": True,
         "draft_lr": 1e-4,
         "draft_online_accumulation_steps": 1,
         "draft_warmup_steps": 256,
+        "draft_warmup_save_interval": 10,
         "draft_warmup_batch_size": 1,
         "draft_warmup_accumulation_steps": 16,
         "draft_warmup_max_samples": 2048,
@@ -422,17 +422,20 @@ def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
 
     cfg = args.speculative
     max_steps = int(cfg.get("draft_warmup_steps", 0) or 0)
+    accumulation_steps = int(cfg.get("draft_warmup_accumulation_steps", 1) or 1)
     if max_steps <= 0:
         return
 
     print("=" * 60)
     print("Starting EAGLE draft warmup before SER training")
     print("=" * 60)
+    
+    # create batches of data for draft training
     batches = iter_draft_warmup_batches(
         args,
         tokenizer,
         speculative_engine=speculative_engine,
-        max_steps=max_steps,
+        max_steps=max_steps*accumulation_steps,
         batch_size=max(1, int(cfg.get("draft_warmup_batch_size", 1))),
         max_samples=int(cfg.get("draft_warmup_max_samples", max_steps)),
         max_length=int(cfg.get("draft_warmup_max_length", args.max_length)),
@@ -442,26 +445,31 @@ def maybe_warmup_speculative_engine(speculative_engine, args, tokenizer, writer)
         teacher_max_new_tokens=max(1, int(cfg.get("draft_warmup_teacher_max_new_tokens", 512))),
         teacher_do_sample=bool(cfg.get("draft_warmup_teacher_do_sample", True)),
         include_prompt_only=bool(cfg.get("draft_warmup_include_prompt_only", False)),
-    )
+    )   # batches = [([In_id1, in_id2, ...], [mask_1, mask_2, ...], len_of_prefix), ...]
+
     warmup_progress = tqdm(total=max_steps, desc="EAGLE draft warmup", dynamic_ncols=True)
     try:
         logs = speculative_engine.pretrain_from_token_batches(
             batches,
             max_steps=max_steps,
             progress_bar=warmup_progress,
+            writer=writer
         )
     finally:
         warmup_progress.close()
-    print(f"EAGLE draft warmup logs: {logs}")
-    if float(logs.get("draft_warmup_train_tokens", 0.0)) <= 0:
+    if float(logs.get("draft_warmup_total_train_tokens", 0.0)) <= 0:
         print("Warning: EAGLE draft warmup did not find any assistant/reference tokens to train on.")
-    if float(logs.get("draft_warmup_optimizer_steps", 0.0)) <= 0:
+    if float(logs.get("draft_warmup_total_optimizer_steps", 0.0)) <= 0:
         print("Warning: EAGLE draft warmup completed without an optimizer step.")
     if writer is not None:
         for key, value in logs.items():
             if isinstance(value, (int, float)) and math.isfinite(float(value)):
                 writer.add_scalar(f"ser/speculative/{key}", float(value), 0)
         writer.flush()
+    print("Finished EAGLE draft warmup before SER training")
+    for key, value in logs.items():
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            print(f"  {key}: {value}")
     if bool(cfg.get("draft_warmup_save", True)):
         output = Path(args.output_dir) / "draft_warmup"
         output.mkdir(parents=True, exist_ok=True)
@@ -486,6 +494,8 @@ def iter_draft_warmup_batches(
     include_prompt_only: bool,
 ):
     rows = collect_draft_warmup_rows(args, max_samples=max_samples)
+    if not rows:
+        return
     encoded: list[tuple[list[int], int]] = []
     pending_teacher_prompts: list[list[int]] = []
     pending_teacher_prefix_lengths: list[int] = []
@@ -538,58 +548,86 @@ def iter_draft_warmup_batches(
         pending_teacher_prompts.clear()
         pending_teacher_prefix_lengths.clear()
 
-    for row in rows:
-        # First try the supervised path: if the row has `answer`, this returns
-        # prompt+answer token ids plus the prompt/assistant boundary.
-        item = encode_draft_warmup_row(
-            tokenizer,
-            row,
-            enable_thinking=args.enable_thinking,
-            max_length=max_length,
-            include_prompt_only=include_prompt_only,
-        )
-
-        # Preferred warmup path: ask the target model to generate an assistant
-        # response from the prompt, then train the draft on target hidden states
-        # from that prompt+generated-response sequence.  If this mode is off,
-        # we only generate for rows that could not use the supervised path.
-        should_generate_with_target = generate_target_responses or (item is None and generate_missing_answers)
-        if should_generate_with_target:
-            prompt_item = encode_draft_warmup_prompt(
+    # Keep cycling through the sampled warmup rows until `max_steps` warmup
+    # batches have been yielded.  This allows small math/code datasets or small
+    # `draft_warmup_max_samples` values to still drive a longer draft warmup.
+    while yielded < max_steps:
+        yielded_at_pass_start = yielded
+        encoded_at_pass_start = len(encoded)
+        made_progress = False
+        for row in rows:
+            # First try the supervised path: if the row has `answer`, this returns
+            # prompt+answer token ids plus the prompt/assistant boundary.
+            item = encode_draft_warmup_row(
                 tokenizer,
                 row,
                 enable_thinking=args.enable_thinking,
                 max_length=max_length,
+                include_prompt_only=include_prompt_only,
             )
-            if prompt_item is not None:
-                prompt_ids, prefix_len = prompt_item
 
-                # Stage prompts until we have enough for one target-generation
-                # micro-batch.  `prefix_len` is kept so later loss masking can
-                # ignore prompt tokens and train on generated response tokens.
-                pending_teacher_prompts.append(prompt_ids)
-                pending_teacher_prefix_lengths.append(prefix_len)
-                if len(pending_teacher_prompts) >= teacher_batch_size:
-                    flush_teacher_prompts()
+            # Preferred warmup path: ask the target model to generate an assistant
+            # response from the prompt, then train the draft on target hidden states
+            # from that prompt+generated-response sequence.  If this mode is off,
+            # we only generate for rows that could not use the supervised path.
+            should_generate_with_target = generate_target_responses or (item is None and generate_missing_answers)
+            if should_generate_with_target:
+                prompt_item = encode_draft_warmup_prompt(
+                    tokenizer,
+                    row,
+                    enable_thinking=args.enable_thinking,
+                    max_length=max_length,
+                )
+                if prompt_item is not None:
+                    prompt_ids, prefix_len = prompt_item
+
+                    # Stage prompts until we have enough for one target-generation
+                    # micro-batch.  `prefix_len` is kept so later loss masking can
+                    # ignore prompt tokens and train on generated response tokens.
+                    pending_teacher_prompts.append(prompt_ids)
+                    pending_teacher_prefix_lengths.append(prefix_len)
+                    made_progress = True
+                    if len(pending_teacher_prompts) >= teacher_batch_size:
+                        flush_teacher_prompts()
+                elif item is not None:
+                    # If target generation cannot be formed, fall back to the
+                    # supervised prompt+answer item when one exists.
+                    encoded.append(item)
+                    made_progress = True
             elif item is not None:
-                # If target generation cannot be formed, fall back to the
-                # supervised prompt+answer item when one exists.
+                # Target generation disabled: use the supervised/prompt-only item.
                 encoded.append(item)
-        elif item is not None:
-            # Target generation disabled: use the supervised/prompt-only item.
-            encoded.append(item)
+                made_progress = True
 
-        # Yield padded draft-warmup batches as soon as enough full sequences
-        # have accumulated in `encoded`.
-        while len(encoded) >= batch_size:
-            batch = pop_batch()
-            if batch is not None:
-                yield batch
-            if yielded >= max_steps:
-                return
+            # Yield padded draft-warmup batches as soon as enough full sequences
+            # have accumulated in `encoded`.
+            while len(encoded) >= batch_size:
+                batch = pop_batch()
+                if batch is not None:
+                    yield batch
+                if yielded >= max_steps:
+                    return
 
-    # End of dataset: generate any staged teacher prompts that did not fill a
-    # complete teacher micro-batch, then yield remaining warmup batches.
+        # If a full pass over the sampled rows produced nothing trainable, stop
+        # instead of cycling forever.
+        if (
+            (not made_progress)
+            or (
+                yielded == yielded_at_pass_start
+                and len(encoded) == encoded_at_pass_start
+                and not pending_teacher_prompts
+            )
+        ):
+            break
+
+        # If we still need more batches, cycle over `rows` again.  Target
+        # generation is stochastic when `draft_warmup_teacher_do_sample=true`,
+        # so duplicated prompts can still produce different teacher responses.
+        if yielded >= max_steps:
+            return
+
+    # End of requested cycling: generate any staged teacher prompts that did not
+    # fill a complete teacher micro-batch, then yield remaining warmup batches.
     flush_teacher_prompts()
     while len(encoded) >= batch_size and yielded < max_steps:
         batch = pop_batch()

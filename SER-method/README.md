@@ -88,7 +88,6 @@ EAGLE rollout acceleration is optional and disabled by default. To enable it:
 speculative:
   enabled: true
   train_draft: true
-  draft_adapter_path: ""
   allow_scratch_draft: true
   draft_warmup_steps: 256
   draft_warmup_accumulation_steps: 16
@@ -99,10 +98,7 @@ speculative:
   draft_warmup_include_prompt_only: false
   draft_train_from_target_hidden: true
 ```
-
-If `draft_adapter_path` is empty, the draft model starts from scratch and is
-first aligned to the target with a draft warmup pass over the processed SER
-datasets, then trained online from rollout traces. Checkpoints save
+Checkpoints save
 `speculative.pt` beside the target adapter checkpoint, including the draft model
 and draft optimizer state. By default, warmup asks the target model to generate
 assistant responses for the processed prompts, then computes target hidden

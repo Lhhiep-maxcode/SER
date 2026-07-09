@@ -331,9 +331,9 @@ class EagleDraftModel(nn.Module):
         next_feature_states = self.states_last_norm(next_feature_states)
         draft_hidden_states = self.logits_last_norm(draft_hidden_states)
         return {
-            "hidden_states": draft_hidden_states,
+            "hidden_states": draft_hidden_states,           # draft model internal states g_i before/for feeding to target LM head
             "past_key_values": cache,
-            "next_feature_states": next_feature_states,
+            "next_feature_states": next_feature_states,     # draft model predicted features h_i for next step in rollout
         }
 
 
