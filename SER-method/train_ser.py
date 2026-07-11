@@ -740,7 +740,7 @@ def build_training_batch_from_rollouts(
         "generated_lengths": lengths,
         "env_name": env_name,
         "real_seconds_for_a_rollout": real_time_used,
-        "max_real_seconds_for_a_rollout": max(real_time_used),
+        # "max_real_seconds_for_a_rollout": max(real_time_used),
         "generated_tokens": generated_token_count,
         "early_accepts": early_accepts,
         "early_rejects": early_rejects,

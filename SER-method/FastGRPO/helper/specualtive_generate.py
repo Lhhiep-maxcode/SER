@@ -35,7 +35,13 @@ total_check_time=0
 
 
 def cache_to_key_value_lists(cache):
-    """Return cache tensors as mutable key/value lists across Transformers versions."""
+    """Expose key/value tensors from legacy tuple caches and DynamicCache.
+
+    FastGRPO was originally written against cache objects with public
+    `.key_cache`/`.value_cache` lists.  Newer Transformers may return a
+    `DynamicCache` without those public attributes, so we convert through the
+    official legacy-cache interface when needed.
+    """
 
     if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
         return list(cache.key_cache), list(cache.value_cache)
@@ -44,11 +50,11 @@ def cache_to_key_value_lists(cache):
         return [item[0] for item in legacy], [item[1] for item in legacy]
     if isinstance(cache, (tuple, list)):
         return [item[0] for item in cache], [item[1] for item in cache]
-    raise AttributeError(f"Unsupported cache type for FastGRPO speculative generation: {type(cache)!r}")
+    raise AttributeError(f"Unsupported cache type: {type(cache)!r}")
 
 
 def replace_cache_from_key_value_lists(cache, key_cache, value_cache):
-    """Rebuild a DynamicCache-like object after batch/accepted-path pruning."""
+    """Rebuild the same kind of cache after pruning/reordering batches."""
 
     legacy = tuple((key, value) for key, value in zip(key_cache, value_cache))
     if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
@@ -379,9 +385,10 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             position_ids = cache_position.unsqueeze(0)
         position_ids = position_ids.long()
 
-        # Newer Qwen3/Transformers builds manage RoPE/cache details inside the
-        # native model forward.  Use that path first; keep FastGRPO's manual
-        # decoder loop as a fallback for older models.
+        # Newer Llama/Qwen Transformers implementations own the RoPE/cache
+        # shape logic inside the model forward.  Calling decoder layers by hand
+        # can build cosine/sine tensors with the wrong last dimension, producing
+        # errors like `tensor a (24) must match tensor b (128)`.
         try:
             outputs = model.model(
                 input_ids=input_ids,
@@ -394,44 +401,29 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 return_dict=True,
                 cache_position=cache_position,
             )
-            next_cache = outputs.past_key_values if hasattr(outputs, "past_key_values") else past_key_values
-            if isinstance(next_cache, (tuple, list)):
-                key_cache = [item[0] for item in next_cache]
-                value_cache = [item[1] for item in next_cache]
-                next_cache = replace_cache_from_key_value_lists(DynamicCache(), key_cache, value_cache)
-            return {
-                'last_hidden_state':outputs.last_hidden_state,
-                'past_key_values':next_cache
-            }
         except TypeError:
-            pass
-            
-        inputs_embeds = model.model.embed_tokens(input_ids)
-
-        hidden_states = inputs_embeds
-
-        position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
-
-        for decoder_layer in model.model.layers[: model.model.config.num_hidden_layers]:
-
-            layer_outputs = decoder_layer(
-                hidden_states,
+            # Some older Transformers versions do not accept `cache_position`.
+            # Keep the native forward path, but omit only that newer argument.
+            outputs = model.model(
+                input_ids=input_ids,
                 attention_mask=attention_mask,
+                past_key_values=past_key_values,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=False,
                 use_cache=True,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
             )
 
-            hidden_states = layer_outputs[0]
-
-        hidden_states = model.model.norm(hidden_states)
+        next_cache = outputs.past_key_values if hasattr(outputs, "past_key_values") else past_key_values
+        if isinstance(next_cache, (tuple, list)):
+            key_cache = [item[0] for item in next_cache]
+            value_cache = [item[1] for item in next_cache]
+            next_cache = replace_cache_from_key_value_lists(DynamicCache(), key_cache, value_cache)
 
         return {
-            'last_hidden_state':hidden_states,
-            'past_key_values':past_key_values
+            'last_hidden_state':outputs.last_hidden_state,
+            'past_key_values':next_cache
         }
 
 
