@@ -38,6 +38,17 @@ beta: 0.01
 
 rollout_chunk_tokens: 256
 rollout_generation_batch_size: 32
+speculative:
+  enabled: false
+  draft_model_path: ""
+  draft_num_layers: 1
+  verification_capacity: 160
+  max_draft_token_length: 5
+  min_draft_token_length: 3
+  max_draft_k: 8
+  max_verification_num: 160
+  draft_token_length_c: 0.75
+  fallback_batch_size: 0
 enable_thinking: true
 allow_code_execution: false
 code_timeout_seconds: 10.0

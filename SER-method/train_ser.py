@@ -47,6 +47,7 @@ from data_utils import load_processed_dataset, render_full_message, render_promp
 from reward_utils import RewardStats, compute_reward  # noqa: E402
 from budget_allocator import BudgetAllocator  # noqa: E402
 from critic_client import CriticClient  # noqa: E402
+from fastgrpo_adapter import build_fastgrpo_speculative_engine  # noqa: E402
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -83,6 +84,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "beta": 0.01,
     "rollout_chunk_tokens": 256,
     "rollout_generation_batch_size": 8,
+    "speculative": {
+        "enabled": False,
+        "draft_model_path": "",
+        "draft_num_layers": 1,
+        "verification_capacity": 160,
+        "max_draft_token_length": 5,
+        "min_draft_token_length": 3,
+        "max_draft_k": 8,
+        "max_verification_num": 160,
+        "draft_token_length_c": 0.75,
+        "fallback_batch_size": 0,
+    },
     "enable_thinking": True,
     "allow_code_execution": False,
     "code_timeout_seconds": 5.0,
@@ -205,6 +218,7 @@ def main() -> None:
     model = build_model(args)
     print_trainable_parameters(model)
     model.train()
+    speculative_engine = build_fastgrpo_speculative_engine(args, model, tokenizer)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.target_lr, betas=(0.9, 0.95), weight_decay=0.05)
     state = TrainingState()
@@ -262,6 +276,7 @@ def main() -> None:
                     args,
                     critic,
                     reward_stats,
+                    speculative_engine=speculative_engine,
                 )
                 # env_rollout_batches = {
                 #   'math': {'messages': [...], 'rewards': [...], 'advantages': [...], ...}, 
@@ -324,6 +339,7 @@ def main() -> None:
                     iteration=iteration,
                     allocation=allocation,
                     env_rollout_batches=env_rollout_batches,
+                    speculative_engine=speculative_engine,
                 )
                 print(log_record)
                 print("Writing log to file ...")
@@ -407,6 +423,7 @@ def collect_mixed_ser_rollouts(
     args,
     critic: CriticClient,
     reward_stats: RewardStats,
+    speculative_engine=None,
 ) -> dict[str, dict[str, Any]]:
     items: list[RolloutItem] = []
     for env_name, rows in rows_by_env.items():
@@ -452,6 +469,7 @@ def collect_mixed_ser_rollouts(
                     [items[idx].token_ids for idx in batch_indices],
                     max_new_tokens,
                     args,
+                    speculative_engine=speculative_engine,
                 )
 
                 for idx, token_ids in zip(batch_indices, generated):
@@ -585,7 +603,24 @@ def initialize_rollout_items(tokenizer, rows: list[dict[str, Any]], args, *, env
     return items
 
 
-def generate_token_chunk(model, tokenizer, token_lists: list[list[int]], max_new_tokens: int, args) -> list[list[int]]:
+def generate_token_chunk(
+    model,
+    tokenizer,
+    token_lists: list[list[int]],
+    max_new_tokens: int,
+    args,
+    speculative_engine=None,
+) -> list[list[int]]:
+    if speculative_engine is not None:
+        return speculative_engine.generate(
+            token_lists,
+            max_new_tokens,
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            pad_token_id=int(tokenizer.pad_token_id),
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
     pad_id = tokenizer.pad_token_id
     max_len = max(len(tokens) for tokens in token_lists)
     input_ids = []
@@ -999,6 +1034,7 @@ def build_log_record(
     iteration,
     allocation: dict[str, int] | None = None,
     env_rollout_batches: dict[str, dict[str, Any]] | None = None,
+    speculative_engine=None,
 ):
     lengths = rollout_batch["generated_lengths"]
     record = {
@@ -1044,6 +1080,8 @@ def build_log_record(
     for key, value in sorted(reward_stats.code_errors.items()):
         record[f"code_errors/{key}"] = float(value)
     record.update(allocator.as_dict())
+    if speculative_engine is not None:
+        record.update(speculative_engine.pop_log_stats())
     return record
 
 
