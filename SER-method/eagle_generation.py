@@ -336,7 +336,7 @@ class EagleSpeculativeEngine:
         total_train_tokens = 0
         optimizer_steps_before = self.draft_optimizer_steps
         start_time = time.time()
-        for iter, input_ids, attention_mask, prefix_lengths in enumerate(batches):
+        for iter, (input_ids, attention_mask, prefix_lengths) in enumerate(batches):
             if iter < self.draft_accumulated_batches:
                 total_examples += len(input_ids)
                 progress_bar.update(1)
