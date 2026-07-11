@@ -968,7 +968,7 @@ def generate_token_chunk(
 ) -> list[list[int]]:
     pad_id = tokenizer.pad_token_id
     if speculative_engine is not None and speculative_engine.enabled():
-        return speculative_engine.generate(
+        result = speculative_engine.generate(
             token_lists,
             max_new_tokens,
             temperature=args.temperature,
@@ -976,7 +976,10 @@ def generate_token_chunk(
             pad_token_id=pad_id,
             eos_token_id=tokenizer.eos_token_id,
         )
+        if result:
+            return result
 
+    # Backup of normal generation
     max_len = max(len(tokens) for tokens in token_lists)
     input_ids = []
     attention_mask = []

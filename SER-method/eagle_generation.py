@@ -148,13 +148,15 @@ class EagleSpeculativeEngine:
     def should_fallback(self, batch_size: int) -> bool:
         if not torch.cuda.is_available():
             return True
-        fallback_batch_size = self.cfg.get("fallback_batch_size")
-        if fallback_batch_size is not None and int(fallback_batch_size) > 0 and batch_size >= int(fallback_batch_size):
-            return True
+
+        # Compute how many draft candidates/verification slots each sequence can get.
+        # Larger batch_size means the fixed verification budget is split across more
+        # sequences, so each sequence gets fewer speculative candidates.
         verification_num = min(
             math.floor(float(self.cfg.get("verification_capacity", 160)) / max(1, batch_size)),
             int(self.cfg.get("max_verification_num", 160)),
         )
+
         return verification_num <= 1
 
     def generate(
@@ -171,21 +173,7 @@ class EagleSpeculativeEngine:
             return []
         if self.should_fallback(len(token_lists)):
             self.stats.fallback_calls += 1
-            results = normal_generate(
-                self.target_model,
-                self.tokenizer,
-                token_lists,
-                max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-            )
-            self.stats.generated_tokens += sum(
-                max(0, len(result) - len(tokens))
-                for result, tokens in zip(results, token_lists)
-            )
-            return results
+            return []
 
         input_tensor, attention_mask, _ = pad_left(token_lists, pad_token_id, self.wrapper.device)
         max_total_length = input_tensor.shape[-1] + int(max_new_tokens)
