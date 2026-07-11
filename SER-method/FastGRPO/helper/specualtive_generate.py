@@ -48,6 +48,22 @@ def cache_to_key_value_lists(cache):
     if hasattr(cache, "to_legacy_cache"):
         legacy = cache.to_legacy_cache()
         return [item[0] for item in legacy], [item[1] for item in legacy]
+    if hasattr(cache, "layers"):
+        key_cache = []
+        value_cache = []
+        for layer in cache.layers:
+            key = getattr(layer, "keys", None)
+            value = getattr(layer, "values", None)
+            if key is None or value is None:
+                continue
+            key_cache.append(key)
+            value_cache.append(value)
+        if key_cache:
+            return key_cache, value_cache
+    if hasattr(cache, "__iter__"):
+        legacy = list(cache)
+        if legacy:
+            return [item[0] for item in legacy], [item[1] for item in legacy]
     if isinstance(cache, (tuple, list)):
         return [item[0] for item in cache], [item[1] for item in cache]
     raise AttributeError(f"Unsupported cache type: {type(cache)!r}")
@@ -61,10 +77,29 @@ def replace_cache_from_key_value_lists(cache, key_cache, value_cache):
         cache.key_cache = list(key_cache)
         cache.value_cache = list(value_cache)
         return cache
+    if hasattr(cache, "layers") and len(getattr(cache, "layers", [])) == len(key_cache):
+        for layer, key, value in zip(cache.layers, key_cache, value_cache):
+            layer.keys = key
+            layer.values = value
+            if hasattr(layer, "is_initialized"):
+                layer.is_initialized = True
+            if hasattr(layer, "dtype"):
+                layer.dtype = key.dtype
+            if hasattr(layer, "device"):
+                layer.device = key.device
+        return cache
     if hasattr(type(cache), "from_legacy_cache"):
         return type(cache).from_legacy_cache(legacy)
     if hasattr(DynamicCache, "from_legacy_cache"):
         return DynamicCache.from_legacy_cache(legacy)
+    try:
+        return type(cache)(legacy)
+    except TypeError:
+        pass
+    try:
+        return DynamicCache(legacy)
+    except TypeError:
+        pass
     return legacy
 
 
