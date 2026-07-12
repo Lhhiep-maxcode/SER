@@ -30,6 +30,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from fastgrpo_adapter import FastGRPOSpeculativeEngine
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -218,6 +219,7 @@ def main() -> None:
     model = build_model(args)
     print_trainable_parameters(model)
     model.train()
+    # Build speculative engine including (wrapper of draft and target model) + tokenizer.
     speculative_engine = build_fastgrpo_speculative_engine(args, model, tokenizer)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.target_lr, betas=(0.9, 0.95), weight_decay=0.05)
@@ -423,7 +425,7 @@ def collect_mixed_ser_rollouts(
     args,
     critic: CriticClient,
     reward_stats: RewardStats,
-    speculative_engine=None,
+    speculative_engine: FastGRPOSpeculativeEngine | None = None,
 ) -> dict[str, dict[str, Any]]:
     items: list[RolloutItem] = []
     for env_name, rows in rows_by_env.items():
@@ -494,7 +496,7 @@ def collect_mixed_ser_rollouts(
                     thresholds = args.thresholds[item.env_name]
                     item.time_used += (time.time() - time_start)
 
-                    if should_query_critic(item, thresholds):   # check if the trajectory have enough token and divisible by check_every_tokens
+                    if args.critic.enabled and should_query_critic(item, thresholds):   # check if the trajectory have enough token and divisible by check_every_tokens
                         # Speculative path: ask the critic whether this partial
                         # trajectory is already clearly good or clearly bad.
                         item.critic_calls += 1
@@ -609,7 +611,7 @@ def generate_token_chunk(
     token_lists: list[list[int]],
     max_new_tokens: int,
     args,
-    speculative_engine=None,
+    speculative_engine: FastGRPOSpeculativeEngine | None = None,
 ) -> list[list[int]]:
     if speculative_engine is not None:
         return speculative_engine.generate(
