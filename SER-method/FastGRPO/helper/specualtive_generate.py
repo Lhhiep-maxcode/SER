@@ -362,7 +362,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         total_position_ids=torch.concat(total_position_ids, dim=1) # (bsz, node_nums)
         confidences=torch.concat(confidences, dim=-1) # (bsz, node_nums)
         
-        chosen_index=torch.topk(confidences, k=draft_total_token, dim=-1)
+        k = min(draft_total_token, confidences.shape[-1])
+        chosen_index=torch.topk(confidences, k=k, dim=-1)
         chosen_index, _=torch.sort(chosen_index.indices, dim=-1, descending=False)
         chosen_index_list=chosen_index.to(torch.int16).cpu().tolist()
         
