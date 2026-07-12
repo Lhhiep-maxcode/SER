@@ -496,7 +496,7 @@ def collect_mixed_ser_rollouts(
                     thresholds = args.thresholds[item.env_name]
                     item.time_used += (time.time() - time_start)
 
-                    if args.critic.enabled and should_query_critic(item, thresholds):   # check if the trajectory have enough token and divisible by check_every_tokens
+                    if bool(args.critic.get("enabled", True)) and should_query_critic(item, thresholds):   # check if the trajectory have enough token and divisible by check_every_tokens
                         # Speculative path: ask the critic whether this partial
                         # trajectory is already clearly good or clearly bad.
                         item.critic_calls += 1
@@ -985,7 +985,7 @@ def compute_grpo_loss(*, logps, old_logps, ref_logps, mask, reward, epsilon: flo
 def build_model(args):
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
-        torch_dtype="auto",
+        dtype="auto",
         trust_remote_code=True,
     ).cuda()
     base_model.config.use_cache = bool(args.use_cache)

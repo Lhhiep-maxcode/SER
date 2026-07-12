@@ -82,7 +82,7 @@ print(dataset)
 config=AutoConfig.from_pretrained(model_dir)
 model_type=args.model_type
 target_model = AutoModelForCausalLM.from_pretrained(
-    model_dir, torch_dtype='auto',config=config)
+    model_dir, dtype='auto',config=config)
 target_model.eval()
 
 config.rope_scaling=None

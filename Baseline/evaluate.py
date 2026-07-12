@@ -46,7 +46,7 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16 if config.get("bf16", False) else "auto",
+        dtype=torch.bfloat16 if config.get("bf16", False) else "auto",
         device_map=config.get("eval_device_map", "auto"),
         trust_remote_code=True,
     )

@@ -178,10 +178,10 @@ class DraftAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.attention_dropout = config.attention_dropout
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, dtype=config.torch_dtype)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, dtype=config.torch_dtype)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, dtype=config.torch_dtype)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False, dtype=config.torch_dtype)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, dtype=config.dtype)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, dtype=config.dtype)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, dtype=config.dtype)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False, dtype=config.dtype)
         self._init_rope()
 
     def _init_rope(self):
@@ -270,9 +270,9 @@ class DraftMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.torch_dtype)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.torch_dtype)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=config.torch_dtype)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.dtype)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.dtype)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=config.dtype)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -289,9 +289,9 @@ class EagleFS(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.torch_dtype)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.torch_dtype)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=config.torch_dtype)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.dtype)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=config.dtype)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=config.dtype)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states, inputs_embeds):
@@ -381,7 +381,7 @@ class DraftModel(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.dtype=config.torch_dtype
+        self.dtype=config.dtype
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
 
@@ -510,7 +510,7 @@ class Model(nn.Module):
     def __init__(self, config, target_model, path=None):
         super().__init__()
 
-        self.dtype=config.torch_dtype
+        self.dtype=config.dtype
         self.target_model = target_model
         self.draft_model = DraftModel(config)
         self.device=target_model.device

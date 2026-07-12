@@ -344,7 +344,7 @@ def parse_args() -> argparse.Namespace:
 def build_model(args: argparse.Namespace):
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
-        torch_dtype="auto",
+        dtype="auto",
         trust_remote_code=True,
     ).cuda()
     base_model.config.use_cache = bool(args.use_cache)

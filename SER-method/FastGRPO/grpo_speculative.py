@@ -124,7 +124,7 @@ print("=" * 60)
 
 config=AutoConfig.from_pretrained(model_dir)
 target_model = AutoModelForCausalLM.from_pretrained(
-    model_dir, torch_dtype='auto',config=config).cuda()
+    model_dir, dtype='auto',config=config).cuda()
 target_model.eval()
 
 config.rope_scaling=None

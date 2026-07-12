@@ -96,10 +96,10 @@ class FastGRPODraftWrapper(nn.Module):
     def __init__(self, target_model, draft_model_path: str | Path, draft_num_layers: int = 1):
         super().__init__()
         config = deepcopy(target_model.config)
-        dtype = getattr(config, "torch_dtype", None) or getattr(config, "dtype", None)
+        dtype = getattr(config, "dtype", None) or getattr(config, "dtype", None)
         if dtype is None or isinstance(dtype, str):
             dtype = next(target_model.parameters()).dtype
-        config.torch_dtype = dtype
+        config.dtype = dtype
         config.dtype = dtype
         config.rope_scaling = None
         config.num_hidden_layers = int(draft_num_layers)
