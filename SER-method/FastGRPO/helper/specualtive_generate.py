@@ -675,8 +675,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     for token_num in range(1,max_length):
         
         past_kv_len=target_past_key_values.get_seq_length()
-        kv_length=past_kv_len+draft_total_token+1
-        q_length=draft_total_token+1
 
         target_trees=draft_trees
         
@@ -692,6 +690,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         next_token_trees=torch.concat([target_next_token, next_token_trees], dim=-1) # (bsz, q_length)
         target_position_ids = target_position_ids+2
         target_position_ids = torch.concat([(past_position_ids_tensor+1).unsqueeze(-1), target_position_ids], dim=-1) # (bsz, q_length)
+        # The selected draft tree can contain fewer tokens than
+        # `draft_total_token` when the adaptive budget is larger than the
+        # materialized candidate tree.  Build the target mask from the tensor
+        # actually passed to the target model, otherwise SDPA sees e.g. a
+        # [B,1,64,2048] mask for [B,H,53,2037] attention scores.
+        q_length=next_token_trees.shape[-1]
+        kv_length=past_kv_len+q_length
                         
         min_dtype=torch.finfo(model.target_model.dtype).min
         
