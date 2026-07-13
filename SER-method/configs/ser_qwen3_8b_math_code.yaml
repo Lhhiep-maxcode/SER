@@ -42,6 +42,15 @@ speculative:
   enabled: false
   draft_model_path: ""
   draft_num_layers: 1
+  train_draft: false
+  draft_lr: 1.0e-4
+  draft_accumulation_steps: 1
+  draft_train_max_sequences: 8
+  draft_train_max_tokens: 4096
+  draft_train_max_padding_gap: 1024
+  draft_max_grad_norm: 1.0
+  feature_loss_weight: 2.0
+  logit_loss_weight: 0.0
   verification_capacity: 160    # C_peak
   max_draft_token_length: 5     # L_draft^max
   min_draft_token_length: 3     # L_draft^min

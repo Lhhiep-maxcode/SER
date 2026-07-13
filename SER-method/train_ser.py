@@ -89,6 +89,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "draft_model_path": "",
         "draft_num_layers": 1,
+        "train_draft": False,
+        "draft_lr": 1.0e-4,
+        "draft_accumulation_steps": 1,
+        "draft_train_max_sequences": 8,
+        "draft_train_max_tokens": 4096,
+        "draft_train_max_padding_gap": 1024,
+        "draft_max_grad_norm": 1.0,
+        "feature_loss_weight": 2.0,
+        "logit_loss_weight": 0.0,
         "verification_capacity": 160,
         "max_draft_token_length": 5,
         "min_draft_token_length": 3,
@@ -365,10 +374,10 @@ def main() -> None:
                     and state.optimizer_steps % args.save_steps == 0
                     and state.optimizer_steps != state.last_saved_step
                 ):
-                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
+                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator, speculative_engine)
                     state.last_saved_step = state.optimizer_steps
                 if args.max_steps is not None and state.optimizer_steps >= args.max_steps:
-                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
+                    save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator, speculative_engine)
                     return
 
         if state.accumulated_batches % args.accumulation_steps != 0:
@@ -377,7 +386,7 @@ def main() -> None:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             state.optimizer_steps += 1
-        save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator)
+        save_checkpoint(model, tokenizer, optimizer, args, state, loaders, allocator, speculative_engine)
     finally:
         if writer is not None:
             writer.close()
@@ -1097,6 +1106,7 @@ def save_checkpoint(
     state: TrainingState,
     loaders: dict[str, CyclingLoader],
     allocator: BudgetAllocator,
+    speculative_engine=None,
 ) -> None:
     step = int(state.optimizer_steps)
     output = Path(args.output_dir) / f"step{step}"
@@ -1117,6 +1127,8 @@ def save_checkpoint(
         },
         output / "optimizer.pt",
     )
+    if speculative_engine is not None:
+        speculative_engine.save_checkpoint(output)
     print(f"Saved checkpoint to {output}")
 
 
