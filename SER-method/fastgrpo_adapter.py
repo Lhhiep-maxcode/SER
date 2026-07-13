@@ -218,12 +218,12 @@ class FastGRPOSpeculativeEngine:
         if verification_num <= 1:
             return True
         
-        draft_token_length_c = float(self.cfg.get("draft_token_length_c", 1.0))
+        draft_token_length_c = float(self.cfg.get("draft_token_length_c", 0.75))
         if draft_token_length_c <= 0:
             return True
 
         max_draft_token_length = int(self.cfg.get("max_draft_token_length", 5))
-        min_draft_token_length = int(self.cfg.get("min_draft_token_length", 1))
+        min_draft_token_length = int(self.cfg.get("min_draft_token_length", 3))
 
         draft_token_length = min(math.floor(math.log2(verification_num/draft_token_length_c)), max_draft_token_length)
         
@@ -275,7 +275,8 @@ class FastGRPOSpeculativeEngine:
                 max_verification_num=int(self.cfg.get("max_verification_num", 160)),
                 min_draft_token_length=int(self.cfg.get("min_draft_token_length", 3)),
                 draft_token_length_c=float(self.cfg.get("draft_token_length_c", 0.75)),
-                statistical_time=True,
+                statistical_time=bool(self.cfg.get("profile_timing", False)),
+                transfer_workers=int(self.cfg.get("transfer_workers", 1)),
                 return_all_draft_input=False,
                 max_length=max_total_length,
             )

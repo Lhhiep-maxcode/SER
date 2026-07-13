@@ -49,6 +49,8 @@ speculative:
   max_verification_num: 160     # N_verify^max
   draft_token_length_c: 0.75    # α
   fallback_batch_size: 0
+  profile_timing: false
+  transfer_workers: 1
 enable_thinking: true
 allow_code_execution: false
 code_timeout_seconds: 10.0

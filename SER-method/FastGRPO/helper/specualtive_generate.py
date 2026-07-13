@@ -208,7 +208,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         max_draft_token_length=5, max_draft_k=8, max_verification_num=160,
                         min_draft_token_length=3, draft_token_length_c=0.75,
                         statistical_time=True,return_all_draft_input=False,
-                        max_length=2048
+                        max_length=2048,
+                        transfer_workers=1,
                         ):
 
 
@@ -300,15 +301,17 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             if isinstance(padding_positions_tensor, torch.Tensor):
                 draft_attention_mask[padding_positions_tensor[:, 0], 0, :, padding_positions_tensor[:, 1]] = min_dtype
 
-            torch.cuda.synchronize()
-            check_time_start=time.time()
+            if statistical_time:
+                torch.cuda.synchronize()
+                check_time_start=time.time()
             
             draft_outputs=model(hidden_states=next_feature_states,input_ids=draft_next_token,
                                 attention_mask=draft_attention_mask,use_cache=True,
                                 past_key_values=draft_past_key_values_tree,position_ids=draft_position_ids)
             
-            torch.cuda.synchronize()
-            total_check_time+=time.time()-check_time_start
+            if statistical_time:
+                torch.cuda.synchronize()
+                total_check_time+=time.time()-check_time_start
             
             draft_past_key_values_tree=draft_outputs['past_key_values']
             draft_hidden_states=draft_outputs['hidden_states']
@@ -496,7 +499,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         return attention_mask
 
 
-    torch.cuda.synchronize()
+    if statistical_time:
+        torch.cuda.synchronize()
     start_time=time.time()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
@@ -506,7 +510,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     device=model.target_model.device
     
     transfer_stream = torch.cuda.Stream(device)
-    executor = ThreadPoolExecutor(max_workers=64)
+    executor = ThreadPoolExecutor(max_workers=max(1, int(transfer_workers)))
 
     prefill_time_start=time.time()
     target_time_start=time.time()
@@ -1179,7 +1183,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         filtered_generated_token_ids.append(sequence_without_padding)
         max_sequence_length=max(max_sequence_length,len(sequence_without_padding))
 
-    return {
+    result = {
         'generated_token_ids':filtered_generated_token_ids,
         'max_sequence_length':max_sequence_length,
         'total_acc_length':avg_acc_length[0],
@@ -1194,4 +1198,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'all_draft_input_states':all_draft_input_states,
         'all_draft_input_ids':all_draft_input_ids
     }
+    executor.shutdown(wait=True)
+    return result
     

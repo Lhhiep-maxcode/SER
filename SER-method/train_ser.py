@@ -96,6 +96,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_verification_num": 160,
         "draft_token_length_c": 0.75,
         "fallback_batch_size": 0,
+        "profile_timing": False,
+        "transfer_workers": 1,
     },
     "enable_thinking": True,
     "allow_code_execution": False,
