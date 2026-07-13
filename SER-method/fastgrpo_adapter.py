@@ -205,14 +205,29 @@ class FastGRPOSpeculativeEngine:
     def should_fallback(self, batch_size: int) -> bool:
         if not torch.cuda.is_available():
             return True
+        
         fallback_batch_size = int(self.cfg.get("fallback_batch_size", 0) or 0)
         if fallback_batch_size > 0 and batch_size >= fallback_batch_size:
             return True
+        
         verification_num = min(
             math.floor(float(self.cfg.get("verification_capacity", 160)) / max(1, batch_size)),
             int(self.cfg.get("max_verification_num", 160)),
         )
-        return verification_num <= 1
+
+        if verification_num <= 1:
+            return True
+        
+        draft_token_length_c = float(self.cfg.get("draft_token_length_c", 1.0))
+        if draft_token_length_c <= 0:
+            return True
+
+        max_draft_token_length = int(self.cfg.get("max_draft_token_length", 5))
+        min_draft_token_length = int(self.cfg.get("min_draft_token_length", 1))
+
+        draft_token_length = min(math.floor(math.log2(verification_num/draft_token_length_c)), max_draft_token_length)
+        
+        return draft_token_length < min_draft_token_length
 
     def generate(
         self,
