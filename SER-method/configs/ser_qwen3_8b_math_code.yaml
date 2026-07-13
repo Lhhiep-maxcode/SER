@@ -18,6 +18,7 @@ max_env_samples:
   code:
 shuffle_dataset: true
 num_workers: 2
+verifier_concurrency: 0
 
 num_epochs: 1
 max_steps:

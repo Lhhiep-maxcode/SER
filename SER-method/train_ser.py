@@ -16,6 +16,7 @@ import random
 import signal
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_env_samples": {"math": None, "code": None},
     "shuffle_dataset": True,
     "num_workers": 2,
+    "verifier_concurrency": 0,
     "num_epochs": 1,
     "max_steps": None,
     "accumulation_steps": 8,
@@ -498,9 +500,11 @@ def collect_mixed_ser_rollouts(
                     completion = tokenizer.decode(item.completion_ids, skip_special_tokens=True)
                     finished = has_eos(item.completion_ids, tokenizer.eos_token_id) or len(item.token_ids) >= args.max_length
                     if finished:
-                        # Full rollout path: once generation naturally stops or
-                        # hits the limit, call the real environment verifier.
-                        verify_rollout(item, completion, args, reward_stats)
+                        # Stop generating this trajectory immediately, but defer
+                        # verifier execution until every environment/rollout has
+                        # finished.  This lets math and code verification run as
+                        # one batched stage instead of interleaving with rollout.
+                        item.decision = "pending_verify"
                         item.time_used += (time.time() - time_start)
                         continue
 
@@ -547,9 +551,9 @@ def collect_mixed_ser_rollouts(
                     critic_errors_by_env.get(item.env_name, 0) + int(bool(result.error))
                 )
                 if result.score >= float(thresholds["accept"]):
-                    # Early accept saves the remaining rollout and verifier
-                    # cost, but gives reward 1 immediately.
-                    item.reward = 1.0
+                    # Early accept saves the remaining rollout cost.  The real
+                    # verifier still runs in the final batched verification
+                    # stage, so the reward remains verifier-grounded.
                     item.decision = "early_accept"
                     item.time_used += (time.time() - time_start)
                     continue
@@ -565,6 +569,8 @@ def collect_mixed_ser_rollouts(
                     next_active.append(idx)
 
         active = next_active
+
+    verify_pending_rollouts(items, tokenizer, args, reward_stats)
 
     env_batches: dict[str, dict[str, Any]] = {}
     for env_name in rows_by_env:
@@ -676,6 +682,72 @@ def should_query_critic(item: RolloutItem, thresholds: dict[str, Any]) -> bool:
     return item.generated_tokens % check_every == 0
 
 
+def verifier_concurrency(args) -> int:
+    configured = int(getattr(args, "verifier_concurrency", 0) or 0)
+    if configured > 0:
+        return configured
+    return max(1, int(getattr(args, "num_workers", 1) or 1))
+
+
+def merge_reward_stats(target: RewardStats, source: RewardStats) -> None:
+    target.math_calls += source.math_calls
+    target.math_correct += source.math_correct
+    target.code_calls += source.code_calls
+    target.code_correct += source.code_correct
+    target.code_timeouts += source.code_timeouts
+    for key, value in source.code_errors.items():
+        target.code_errors[key] = target.code_errors.get(key, 0) + int(value)
+
+
+def verify_rollout_process(entry):
+    idx, row, completion, allow_code_execution, code_timeout_seconds = entry
+    local_stats = RewardStats()
+    start = time.time()
+    reward = compute_reward(
+        completion,
+        row,
+        allow_code_execution=allow_code_execution,
+        code_timeout_seconds=code_timeout_seconds,
+        stats=local_stats,
+    )
+    return idx, reward, local_stats, time.time() - start
+
+
+def verify_pending_rollouts(items: list[RolloutItem], tokenizer, args, reward_stats: RewardStats) -> None:
+    pending = [
+        (
+            idx,
+            item.row,
+            tokenizer.decode(item.completion_ids, skip_special_tokens=True),
+            bool(args.allow_code_execution),
+            float(args.code_timeout_seconds),
+        )
+        for idx, item in enumerate(items)
+        if item.reward is None and item.decision != "early_reject"
+    ]
+    if not pending:
+        return
+
+    workers = min(len(pending), verifier_concurrency(args))
+    if workers <= 1:
+        results = [verify_rollout_process(entry) for entry in pending]
+    else:
+        results = []
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(verify_rollout_process, entry) for entry in pending]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+    for idx, reward, local_stats, elapsed in results:
+        item = items[idx]
+        item.reward = float(reward)
+        item.verifier_called = True
+        if item.decision != "early_accept":
+            item.decision = "verified"
+        item.time_used += float(elapsed)
+        merge_reward_stats(reward_stats, local_stats)
+
+
 def verify_rollout(item: RolloutItem, completion: str, args, reward_stats: RewardStats) -> None:
     item.reward = compute_reward(
         completion,
@@ -685,7 +757,8 @@ def verify_rollout(item: RolloutItem, completion: str, args, reward_stats: Rewar
         stats=reward_stats,
     )
     item.verifier_called = True
-    item.decision = "verified"
+    if item.decision != "early_accept":
+        item.decision = "verified"
 
 
 def build_training_batch_from_rollouts(
