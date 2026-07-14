@@ -291,6 +291,9 @@ class FastGRPOSpeculativeEngine:
             int(self.cfg.get("max_verification_num", 160)),
         )
 
+        if verification_num < self.cfg.get("min_verification_num", 160):
+            return True
+
         if verification_num <= 1:
             return True
         

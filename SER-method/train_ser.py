@@ -104,7 +104,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_draft_token_length": 5,
         "min_draft_token_length": 3,
         "max_draft_k": 8,
-        "max_verification_num": 160,
+        "max_verification_num": 64,
+        "min_verification_num": 32,
         "draft_token_length_c": 0.75,
         "fallback_batch_size": 0,
         "profile_timing": False,
@@ -160,6 +161,7 @@ class RolloutItem:
     decision: str = "active"
     critic_score: float | None = None
     critic_calls: int = 0
+    last_critic_check_tokens: int = 0
     verifier_called: bool = False
     time_used: float = 0.0
 
@@ -677,9 +679,17 @@ def generate_token_chunk(
 def should_query_critic(item: RolloutItem, thresholds: dict[str, Any]) -> bool:
     min_tokens = int(thresholds.get("min_tokens", 0))
     check_every = max(1, int(thresholds.get("check_every_tokens", 1)))
-    if item.generated_tokens < min_tokens:
+
+    # Normal generation usually advances by exactly `check_every` tokens, but
+    # EAGLE can accept different numbers of tokens per sequence.  Trigger when
+    # the rollout crosses the next scheduled checkpoint instead of requiring an
+    # exact modulo hit, otherwise variable-length speculative chunks can miss
+    # judge calls or stagger them unnecessarily.
+    next_check = max(check_every, math.ceil(max(min_tokens, item.last_critic_check_tokens + 1) / check_every) * check_every)
+    if item.generated_tokens < next_check:
         return False
-    return item.generated_tokens % check_every == 0
+    item.last_critic_check_tokens = int(item.generated_tokens)
+    return True
 
 
 def verifier_concurrency(args) -> int:
